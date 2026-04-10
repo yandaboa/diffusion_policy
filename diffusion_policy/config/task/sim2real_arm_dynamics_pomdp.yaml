@@ -1,0 +1,95 @@
+name: sim2real_arm_dynamics_pomdp
+
+shape_meta: &shape_meta
+  obs:
+    end_effector_pose:
+      shape: [6] #[9]
+      type: low_dim
+    joint_pos:
+      shape: [6]
+      type: low_dim
+    prev_actions:
+      shape: [7]
+      type: low_dim
+    # last_arm_action:
+    #   shape: [6]
+    #   type: low_dim
+    # last_gripper_action:
+    #   shape: [1]
+    #   type: low_dim
+    # right_inner_finger_contact_force:
+    #   shape: [3]
+    #   type: low_dim 
+    # left_inner_finger_contact_force:
+    #   shape: [3]
+    #   type: low_dim
+    # held_asset_pose:
+    #   shape: [6] #[9]
+    #   type: low_dim
+    # fixed_asset_pose:
+    #   shape: [6] #[9]
+    #   type: low_dim
+    # held_asset_in_fixed_asset_frame:
+    #   shape: [6] #[9]
+    #   type: low_dim
+    # gripper_contact_forces:
+    #   shape: [6]
+    #   type: low_dim
+    # end_effector_pose:
+    #   shape: [7]
+    #   type: low_dim
+    insertive_asset_pose:
+      shape: [6]
+      type: low_dim
+    receptive_asset_pose:
+      shape: [6]
+      type: low_dim
+    insertive_asset_in_receptive_asset_frame:
+      shape: [6]
+      type: low_dim
+  action:
+    shape: [7]
+  # auxiliary_obs:
+  #   # gripper_contact_forces:
+  #   #   shape: [6]
+  #   #   type: low_dim
+  #   end_effector_pose:
+  #     shape: [7]
+  #     type: low_dim
+  #   held_asset_pose:
+  #     shape: [7]
+  #     type: low_dim
+  #   fixed_asset_pose:
+  #     shape: [7]
+  #     type: low_dim
+  #   held_asset_in_fixed_asset_frame:
+  #     shape: [7]
+  #     type: low_dim
+
+task_name: &task_name sim2real_arm_dynamics_pomdp
+
+env_runner:
+  _target_: diffusion_policy.env_runner.dummy_runner.DummyRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.sim2real_image_dataset.Sim2RealImageMultiDataset
+  # Option 1: Single dataset directory (backward compatible)
+  # dataset_dir: ../OctiLab/datasets_test
+  
+  # Option 2: Multiple dataset directories with sampling ratios
+  dataset_config:
+    - dataset_dir: ../OctiLab/datasets/0
+      sampling_ratio: 0.9
+  
+  use_streaming: false
+  samples_per_file_multiplier: 1.0
+  shape_meta: *shape_meta
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.05
+  use_cache: false
+  use_disk: true
