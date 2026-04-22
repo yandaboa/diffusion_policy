@@ -6,7 +6,7 @@ shape_meta: &shape_meta
       shape: [6] #[9]
       type: low_dim
     joint_pos:
-      shape: [6]
+      shape: [12]
       type: low_dim
     prev_actions:
       shape: [7]
