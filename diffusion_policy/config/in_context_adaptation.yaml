@@ -2,7 +2,7 @@ defaults:
   - _self_
   - task: sim2real_arm_dynamics_pomdp
 
-name: in-context-exploration
+name: in-context-adaptation
 _target_: diffusion_policy.workspace.train_mlp_image_workspace.TrainMLPImageWorkspace
 output_dir: null
 
@@ -96,13 +96,13 @@ training:
   tqdm_interval_sec: 1.0
 
 logging:
-  project: peg_insertion_distillation
+  project: incontext_adaptation
   resume: True
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null
-  group: "rgb_in_context_exploration_debug"
+  group: "initial"
 
 checkpoint:
   topk:
