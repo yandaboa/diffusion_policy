@@ -39,7 +39,7 @@ task:
 #        a_t / r_t from leaking into the obs_t hidden state. Sequence length
 #        becomes T * (1 + include_action + include_reward).
 policy:
-  _target_: diffusion_policy.policy.transformer_image_policy.TransformerImagePolicy
+  _target_: diffusion_policy.policy.interleaved_transformer_image_policy.InterleavedTransformerImagePolicy
   shape_meta: ${shape_meta}
   obs_encoder:
     _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
@@ -65,7 +65,7 @@ policy:
   # When True, the rolled-out action at step t-1 is concatenated onto the
   # observation token at step t (normalized, zero-padded at t=0). The actual
   # rolled-out actions are read from batch['action'] / obs_dict['action'].
-  include_action_in_context: False
+  include_action_in_context: True
   # When True, the received reward at step t-1 is concatenated onto the
   # observation token at step t (zero-padded at t=0). Rewards are read from
   # batch['reward'] / obs_dict['reward'] (must be present in the dataset).

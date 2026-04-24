@@ -286,6 +286,10 @@ class TrainMLPImageWorkspace(BaseWorkspace):
                         gt_action = batch['action'][:, policy.n_obs_steps-1:policy.n_obs_steps+policy.n_action_steps-1].squeeze()
                         if batch.get('attention_mask', None) is not None:
                             obs_dict['attention_mask'] = batch['attention_mask']
+                        if getattr(policy, 'include_action_in_context', False):
+                            obs_dict['action'] = batch['action']
+                        if getattr(policy, 'include_reward_in_context', False):
+                            obs_dict['reward'] = batch['reward']
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)

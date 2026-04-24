@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any, Dict
 import torch
 import numpy as np
 import copy
@@ -194,17 +194,21 @@ class Sim2RealImageDataset(BaseImageDataset):
         return replay_buffer
 
     def _load_zarr_data(self, dataset_path, use_disk=True):
-        """Load zarr data with disk/memory options"""
+        """Load zarr data with disk/memory options.
+
+        Always loads obs, actions, expert_mask, and episode_ends. Additionally
+        loads `rewards` and `dones` from the zarr store when present so that
+        downstream policies can optionally include them as part of the
+        in-context history.
+        """
         z = zarr.open(dataset_path, mode='r')
         obs_group = z['data']['obs']
         action_arr = z['data']['actions']
         episode_ends = z['meta']['episode_ends']
         expert_mask = z['data']['expert_mask']
 
-        # Create replay buffer
         replay_buffer = ReplayBuffer.create_empty_numpy()
 
-        # Add observations
         for key in obs_group.keys():
             if use_disk:
                 # Keep data on disk (memory mapped)
@@ -217,6 +221,15 @@ class Sim2RealImageDataset(BaseImageDataset):
         replay_buffer.root['data']['action'] = action_arr[:]
         replay_buffer.root['meta']['episode_ends'] = episode_ends[:]
         replay_buffer.root['data']['expert_mask'] = expert_mask[:]
+
+        # Optionally load rewards/dones (rolled-out reward and termination
+        # signals collected during dataset generation). These are small
+        # 1-D arrays so we always load them into memory when present.
+        data_keys = set[Any](z['data'].keys())
+        if 'rewards' in data_keys:
+            replay_buffer.root['data']['reward'] = z['data']['rewards'][:]
+        if 'dones' in data_keys:
+            replay_buffer.root['data']['done'] = z['data']['dones'][:]
 
         return replay_buffer
 
@@ -300,6 +313,20 @@ class Sim2RealImageDataset(BaseImageDataset):
             'action': torch.from_numpy(action),
             'expert_mask': torch.from_numpy(expert_mask),
         }
+
+        # Include rolled-out reward / done when the underlying zarr provided
+        # them. Consumed by policies that condition on reward history.
+        if 'reward' in data:
+            reward = data['reward'].astype(np.float32)
+            if self.n_latency_steps > 0:
+                reward = reward[self.n_latency_steps:]
+            torch_data['reward'] = torch.from_numpy(reward)
+        if 'done' in data:
+            done = data['done'].astype(np.float32)
+            if self.n_latency_steps > 0:
+                done = done[self.n_latency_steps:]
+            torch_data['done'] = torch.from_numpy(done)
+
         return torch_data
 
 
