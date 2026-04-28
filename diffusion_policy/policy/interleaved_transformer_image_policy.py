@@ -27,7 +27,11 @@ from omegaconf import DictConfig
 from transformers import GPT2Config, GPT2Model
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
-from diffusion_policy.model.head.output_head import OutputHead, GaussianOutputHead
+from diffusion_policy.model.head.output_head import (
+    OutputHead,
+    GaussianOutputHead,
+    DiscreteAROutputHead,
+)
 from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsEncoder
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.transformer_image_policy import (
@@ -59,6 +63,10 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
             output_head: Optional[Union[OutputHead, DictConfig, dict, functools.partial]] = None,
             include_action_in_context: bool = False,
             include_reward_in_context: bool = False,
+            head_type: str = "gaussian",
+            num_bins: int = 20,
+            clip_val: float = 50.0,
+            gripper_dim: int = 6,
             **kwargs):
         assert n_action_steps == 1, "MLPImagePolicy only supports n_action_steps=1"
 
@@ -108,11 +116,38 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
         )
         self.transformer = GPT2Model(cfg)
 
-        self.output_head: OutputHead = _build_output_head(
-            output_head, hidden_dim=hidden_dim, action_dim=action_dim)
+        # head_type="discrete_ar" → DiscreteAROutputHead, with this policy
+        # driving autoregressive decoding via repeated forwards through
+        # ``self.transformer`` (AR tokens never enter the persistent KV cache).
+        head_type = str(head_type)
+        assert head_type in ("gaussian", "discrete_ar"), (
+            f"head_type must be 'gaussian' or 'discrete_ar', got {head_type!r}"
+        )
+        self.head_type = head_type
+        if head_type == "gaussian":
+            self.output_head: OutputHead = _build_output_head(
+                output_head, hidden_dim=hidden_dim, action_dim=action_dim)
+        else:
+            if output_head is not None:
+                raise ValueError(
+                    "head_type='discrete_ar' is incompatible with ``output_head``; "
+                    "configure num_bins / clip_val / gripper_dim instead."
+                )
+            self.output_head: OutputHead = DiscreteAROutputHead(
+                hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                num_bins=int(num_bins),
+                clip_val=float(clip_val),
+                gripper_dim=int(gripper_dim),
+            )
 
         self.log_std_limits = (-5.0, 2.0)
         self.sample_timesteps = sample_timesteps
+
+        # Inference behavior toggle: stochastic sampling (data collection /
+        # exploration) vs greedy argmax / threshold (eval). Set externally by
+        # the wrapper at construction time and persisted across calls.
+        self.sample_action: bool = False
 
     # ------------------------------------------------------------------
     # Interleaving helpers
@@ -306,9 +341,15 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
             sample_timesteps=False,
             action=action, reward=reward,
         )
-        action_pred = self.output_head.predict(h, sample=True)
-        action_out = self.normalizer['action'].unnormalize(action_pred)
         seq_lens = attention_mask.sum(dim=1)
+        if self.head_type == "discrete_ar":
+            h_obs = h[torch.arange(B), seq_lens - 1, :]
+            indices = self._ar_inference_loop(h_obs, sample=self.sample_action)
+            action_out = self.output_head.decode_bins_to_action(indices)
+            return {'action': action_out, 'action_pred': action_out}
+
+        action_pred = self.output_head.predict(h, sample=self.sample_action)
+        action_out = self.normalizer['action'].unnormalize(action_pred)
         action_pred = action_pred[torch.arange(B), seq_lens - 1, :]
         action_out = action_out[torch.arange(B), seq_lens - 1, :]
         return {
@@ -396,6 +437,68 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
         prev_toks = per_type[1:]
         inputs_embeds = torch.cat(prev_toks + [obs_tok], dim=1)
         return inputs_embeds, self.tokens_per_step
+
+    # Discrete-AR decoding. The AR loop runs the main trunk on a transient
+    # sub-sequence (h_obs as token 0, then one new bin/dim token per AR step).
+    # The transient KV cache is built and discarded inside the call — no AR
+    # state ever enters the persistent obs/context cache. AR position ids are
+    # local (0..D-1), independent of the obs trunk's per-step positions.
+    def _ar_inference_loop(self, h_obs: torch.Tensor, sample: bool = False) -> torch.Tensor:
+        """``(B, H)`` h_obs → ``(B, D)`` per-dim indices (bin idx for arm, ``{0,1}`` for gripper).
+
+        ``sample=False`` (default) is greedy — argmax over arm logits and threshold the
+        gripper sigmoid at 0. Pass ``sample=True`` for stochastic rollouts.
+        """
+        head: DiscreteAROutputHead = self.output_head  # type: ignore[assignment]
+        D = self.action_dim
+        B = h_obs.shape[0]
+        device = h_obs.device
+
+        indices = torch.zeros(B, D, dtype=torch.long, device=device)
+        cur_token = h_obs.unsqueeze(1)
+        ar_past = None
+        ar_past_len = 0
+
+        for k in range(D):
+            attn_mask = torch.ones(B, ar_past_len + 1, device=device, dtype=torch.long)
+            position_ids = torch.full((B, 1), ar_past_len, device=device, dtype=torch.long)
+            out = self.transformer(
+                inputs_embeds=cur_token,
+                past_key_values=ar_past,
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+                use_cache=True,
+            )
+            idx = head.step_inference(out.last_hidden_state[:, -1, :], dim=k, sample=sample)
+            indices[:, k] = idx
+            ar_past = out.past_key_values
+            ar_past_len += 1
+            if k < D - 1:
+                cur_token = head.ar_input_token(idx, dim=k + 1).unsqueeze(1)
+        return indices
+
+    def _ar_train_forward(self, h_obs_flat: torch.Tensor, target_bins_flat: torch.Tensor) -> torch.Tensor:
+        """Teacher-forced AR forward: ``(N, H)`` + ``(N, D)`` bins → ``(N, D, H)`` per-dim hidden."""
+        head: DiscreteAROutputHead = self.output_head  # type: ignore[assignment]
+        D = self.action_dim
+        token_0 = h_obs_flat.unsqueeze(1)
+        if D > 1:
+            ar_tokens = head.ar_input_sequence_train(target_bins_flat[:, : D - 1])
+            seq = torch.cat([token_0, ar_tokens], dim=1)
+        else:
+            seq = token_0
+        return self.transformer(inputs_embeds=seq, use_cache=False).last_hidden_state
+
+    def _decode_step(self, last_hidden_state: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if self.head_type == "discrete_ar":
+            h_obs = last_hidden_state[:, -1, :]
+            indices = self._ar_inference_loop(h_obs, sample=self.sample_action)
+            action = self.output_head.decode_bins_to_action(indices)
+            return {'action': action, 'action_pred': action}
+        h_last = last_hidden_state[:, -1:, :]
+        action_pred = self.output_head.predict(h_last, sample=self.sample_action)
+        action = self.normalizer['action'].unnormalize(action_pred)
+        return {'action': action.squeeze(1), 'action_pred': action_pred.squeeze(1)}
 
     def kv_cached_step(
         self,
@@ -500,7 +603,6 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
         nobs_features = self.obs_encoder(this_nobs)
         nobs_features = nobs_features.reshape(B, T, -1)
         attention_mask = batch['attention_mask']
-        target = nactions
 
         action, reward = self._build_action_reward_train(batch)
 
@@ -511,4 +613,32 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
             action=action, reward=reward,
         )
         loss_mask = expert_mask[..., 0] * attention_mask  # (B, T)
-        return self.output_head.compute_loss(h, target, loss_mask)
+
+        if self.head_type == "discrete_ar":
+            # Second trunk forward over the AR sequence (teacher-forced); since
+            # it has no past, action tokens can't leak into obs context — same
+            # invariant as inference. Targets recovered in closed form: arm
+            # bins via affine round, gripper as binary class from sign.
+            raw_actions = batch['action']  # (B, T, action_dim)
+            head: DiscreteAROutputHead = self.output_head  # type: ignore[assignment]
+            num_bins = head.num_bins
+            scale = (num_bins - 1) / (2.0 * head.clip_val)
+            target_bins = ((raw_actions + head.clip_val) * scale).round().long().clamp_(0, num_bins - 1)
+            target_bins[..., head.gripper_dim] = (raw_actions[..., head.gripper_dim] >= 0).long()
+
+            mask_flat = loss_mask.reshape(-1).bool()
+            if mask_flat.sum() == 0:
+                return h.sum() * 0.0
+            h_flat = h.reshape(-1, h.shape[-1])[mask_flat]  # (N, H)
+            tb_flat = target_bins.reshape(-1, self.action_dim)[mask_flat]  # (N, D)
+
+            ar_h = self._ar_train_forward(h_flat, tb_flat)  # (N, D, H)
+            # Scatter back to (B, T, D, H) so the head reapplies loss_mask.
+            per_dim_hidden = h.new_zeros(B * T, self.action_dim, h.shape[-1])
+            per_dim_hidden[mask_flat] = ar_h
+            per_dim_hidden = per_dim_hidden.reshape(B, T, self.action_dim, h.shape[-1])
+            return self.output_head.compute_loss_from_per_dim_hidden(
+                per_dim_hidden, target_bins, loss_mask
+            )
+
+        return self.output_head.compute_loss(h, nactions, loss_mask)

@@ -2,15 +2,15 @@ defaults:
   - _self_
   - task: sim2real_arm_dynamics_pomdp
 
-name: in-context-adaptation
+name: in-context-adaptation-smoke
 _target_: diffusion_policy.workspace.train_mlp_image_workspace.TrainMLPImageWorkspace
 output_dir: null
 
 task_name: '${task.name}'
 shape_meta: ${task.shape_meta}
-exp_name: "default"
+exp_name: "smoke"
 
-horizon: 1024
+horizon: 128
 n_obs_steps: 1
 n_action_steps: 1
 n_latency_steps: 0
@@ -18,26 +18,16 @@ dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
-seed: null
+seed: 0
 iteration: null
 
 task:
   dataset:
     return_sequences: true
-      
-# Two interchangeable context-augmentation strategies share this config block:
-#
-#   1) diffusion_policy.policy.transformer_image_policy.TransformerImagePolicy
-#      - Feature-concat: prev-step action/reward are concatenated onto the
-#        observation token's feature vector (shifted right by 1, zero-pad at
-#        t=0). Sequence length stays T.
-#
-#   2) diffusion_policy.policy.interleaved_transformer_image_policy.InterleavedTransformerImagePolicy
-#      - DT-style: obs / action / reward are separate tokens interleaved as
-#        [obs_t, a_t, r_t, obs_{t+1}, a_{t+1}, r_{t+1}, ...]. Each token type
-#        has its own projection + type embedding; causal masking keeps
-#        a_t / r_t from leaking into the obs_t hidden state. Sequence length
-#        becomes T * (1 + include_action + include_reward).
+
+# Smoke variant of in_context_adaptation_interleave: tiny trunk, tiny dataloader,
+# tiny step budget. Exercises the discrete-AR + inverse-action path end-to-end
+# fast enough to surface plumbing bugs.
 policy:
   _target_: diffusion_policy.policy.interleaved_transformer_image_policy.InterleavedTransformerImagePolicy
   shape_meta: ${shape_meta}
@@ -57,47 +47,41 @@ policy:
   horizon: ${horizon}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
-  hidden_dim: 256
-  hidden_depth: 4
-  n_head: 4
-  dropout: 0.1
+  hidden_dim: 64
+  hidden_depth: 2
+  n_head: 2
+  dropout: 0.0
 
-  # Previous-step action / reward fed as the context-action / context-reward
-  # tokens (normalized, zero-padded at t=0). Read from batch['action'] /
-  # batch['reward'] (and obs_dict['action'] / obs_dict['reward'] at inference).
   include_action_in_context: True
   include_reward_in_context: False
 
-  # Action head: 'gaussian' (continuous) or 'discrete_ar' (per-dim categorical
-  # over a fixed bin grid, autoregressively decoded by repeated trunk forwards).
   head_type: discrete_ar
-  num_bins: 100
+  num_bins: 20
   clip_val: 50.0
   gripper_dim: 6
-  # Must be null when head_type=discrete_ar.
   output_head: null
 
 dataloader:
-  batch_size: 32
-  num_workers: 16
+  batch_size: 4
+  num_workers: 0
   shuffle: True
-  pin_memory: True
-  persistent_workers: True
-  prefetch_factor: 8
+  pin_memory: False
+  persistent_workers: False
+  prefetch_factor: null
   drop_last: False
 
 val_dataloader:
-  batch_size: 32
-  num_workers: 16
+  batch_size: 4
+  num_workers: 0
   shuffle: False
-  pin_memory: True
-  persistent_workers: True
-  prefetch_factor: 8
+  pin_memory: False
+  persistent_workers: False
+  prefetch_factor: null
   drop_last: False
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-5
+  lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-6
@@ -106,37 +90,37 @@ training:
   device: "cuda"
   seed: ${seed}
   debug: False
-  resume: True
+  resume: False
   lr_scheduler: cosine
-  lr_warmup_steps: 500
-  num_epochs: 20
+  lr_warmup_steps: 5
+  num_epochs: 1
   gradient_accumulate_every: 1
   gradient_clip_norm: 1.0
   use_ema: False
   freeze_encoder: False
-  rollout_every: 5000
-  checkpoint_every: 1000  # checkpoint every 10000 gradient steps
+  rollout_every: 100000
+  checkpoint_every: 25
   val_every: 1
   sample_every: 1
   max_train_steps: null
-  max_val_steps: null
-  max_gradient_steps: 50000
+  max_val_steps: 1
+  max_gradient_steps: 50
   tqdm_interval_sec: 1.0
 
 logging:
-  project: incontext_adaptation
-  resume: True
-  mode: online
+  project: incontext_adaptation_smoke
+  resume: False
+  mode: disabled
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
-  tags: ["${name}", "${task_name}", "${exp_name}"]
+  tags: ["${name}", "${task_name}", "${exp_name}", "smoke"]
   id: null
-  group: "initial"
+  group: "smoke"
 
 checkpoint:
   topk:
     monitor_key: train_action_mse_error
     mode: min
-    k: 5
+    k: 1
     format_str: 'epoch={epoch:04d}-train_action_mse_error={train_action_mse_error:.3f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
@@ -153,4 +137,4 @@ hydra:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
-    subdir: ${hydra.job.num} 
+    subdir: ${hydra.job.num}
