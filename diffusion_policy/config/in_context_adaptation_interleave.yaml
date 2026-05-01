@@ -78,12 +78,12 @@ policy:
   output_head: null
 
 dataloader:
-  batch_size: 32
-  num_workers: 16
+  batch_size: 16
+  num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: True
-  prefetch_factor: 8
+  prefetch_factor: 4
   drop_last: False
 
 val_dataloader:
