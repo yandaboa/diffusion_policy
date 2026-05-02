@@ -15,6 +15,7 @@ import click
 import cv2
 import numpy as np
 import json
+import matplotlib.pyplot as plt
 from diffusion_policy.real_world.real_env import RealEnv
 from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
@@ -60,7 +61,7 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 camera_configs=configs,
                 frequency=frequency,
                 init_joints=init_joints,
-                enable_multi_cam_vis=True,
+                enable_multi_cam_vis=False,
                 record_raw_video=True,
                 thread_per_video=3,
                 video_crf=21,
@@ -70,7 +71,13 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
             ) as env:
             cv2.setNumThreads(1)
 
-            time.sleep(1.0)
+            print('Waiting for environment to be ready (gripper calibration)...')
+            t_ready_deadline = time.monotonic() + 60
+            while not env.is_ready:
+                if time.monotonic() > t_ready_deadline:
+                    raise RuntimeError('Environment not ready after 60 s')
+                time.sleep(0.1)
+
             kd_pos = 2 * np.sqrt(osc_kp_pos) * 1.0
             kd_rot = 2 * np.sqrt(osc_kp_rot) * 1.0
             print(f'OSC: Kp_pos={osc_kp_pos}, Kp_rot={osc_kp_rot}, Kd_pos={kd_pos:.1f}, Kd_rot={kd_rot:.1f}')
@@ -79,6 +86,10 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
             iter_idx = 0
             stop = False
             is_recording = False
+            # inner_finger_knuckle_joint: angle = (gripper_pos / 255) * pi/4
+            _GRIPPER_JOINT_SCALE = np.pi / 4 / 255.0
+            finger_log = []  # list of (timestamp, knuckle_angle_rad)
+            finger_display = 0.0
             while not stop:
                 t_cycle_end = t_start + (iter_idx + 1) * dt
                 t_sample = t_cycle_end - command_latency
@@ -108,7 +119,8 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 stage = key_counter[Key.space]
 
                 # visualize
-                vis_img = obs[f'camera_{vis_camera_idx}'][-1,:,:,::-1].copy()
+                _cam_keys = ['front_rgb', 'side_rgb', 'wrist_rgb']
+                vis_img = obs[_cam_keys[vis_camera_idx]][-1,:,:,::-1].copy()
                 episode_id = env.replay_buffer.n_episodes
                 text = f'Episode: {episode_id}, Stage: {stage}'
                 if is_recording:
@@ -124,6 +136,15 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                     thickness=2,
                     color=(255,255,255)
                 )
+                cv2.putText(
+                    vis_img,
+                    f'Knuckle: {finger_display:.4f} rad',
+                    (10, 65),
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.7,
+                    thickness=2,
+                    color=(0, 255, 255)
+                )
                 cv2.imshow('default', vis_img)
                 cv2.pollKey()
 
@@ -134,12 +155,30 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 gripper_command = mello_values[6]
                 unified_action = np.concatenate([mello_joints, [gripper_command]])
 
+                # inner_finger_knuckle_joint from real gripper POS register
+                gripper_pos_raw = float(obs['gripper_pos'][-1])
+                finger_display = gripper_pos_raw * _GRIPPER_JOINT_SCALE
+                finger_log.append((time.monotonic() - t_start, finger_display))
+
                 env.exec_actions(
                     actions=[unified_action], 
                     timestamps=[t_command_target-time.monotonic()+time.time()],
                     stages=[stage])
                 precise_wait(t_cycle_end)
                 iter_idx += 1
+
+            # Plot inner_finger_knuckle_joint after session ends
+            if finger_log:
+                timestamps = np.array([t for t, _ in finger_log])
+                angles = np.array([a for _, a in finger_log])
+                fig, ax = plt.subplots(figsize=(12, 3))
+                ax.plot(timestamps, angles, linewidth=0.8)
+                ax.set_ylabel('inner_finger_knuckle_joint (rad)')
+                ax.set_xlabel('Time (s)')
+                ax.grid(True)
+                fig.suptitle('Gripper inner_finger_knuckle_joint over session')
+                plt.tight_layout()
+                plt.show()
 
 # %%
 if __name__ == '__main__':

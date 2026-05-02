@@ -23,6 +23,7 @@ class RobotiqGripper:
     PRE = 'PRE'  # position request (echo of last commanded position)
     OBJ = 'OBJ'  # object detection (0 = moving, 1 = outer grip, 2 = inner grip, 3 = no object at rest)
     FLT = 'FLT'  # fault (0=ok, see manual for errors if not zero)
+    GCU = 'GCU'  # motor current (0-255, units of ~10mA) — proxy for gripping force
 
     ENCODING = 'UTF-8'  # ASCII and UTF-8 both seem to work
 
@@ -215,6 +216,14 @@ class RobotiqGripper:
     def get_current_position(self) -> int:
         """Returns the current position as returned by the physical hardware."""
         return self._get_var(self.POS)
+
+    def get_motor_current(self) -> int:
+        """Returns the gripper motor current (0-255, ~10mA per unit). Proxy for gripping force.
+        Returns 0 if the firmware does not support GCU."""
+        try:
+            return self._get_var(self.GCU)
+        except ValueError:
+            return 0
 
     def auto_calibrate(self, log: bool = True) -> None:
         """Attempts to calibrate the open and closed positions, by slowly closing and opening the gripper.

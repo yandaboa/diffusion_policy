@@ -25,6 +25,8 @@ DEFAULT_OBS_KEY_MAP = {
     'ActualQ': 'arm_joint_pos',
     'ActualTCPPose': 'end_effector_pose',  # EE pose [x,y,z,rx,ry,rz] from robot
     'ActualTCPForce': 'tcp_force',  # 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] from F/T sensor
+    'gripper_current': 'gripper_current',  # motor current (0-255, ~10mA/unit), proxy for grip force
+    'gripper_pos': 'gripper_pos',          # raw POS register (0=open, 255=closed)
     # timestamps
     'step_idx': 'step_idx',
     'timestamp': 'timestamp'

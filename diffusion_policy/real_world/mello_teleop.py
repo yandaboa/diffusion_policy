@@ -27,6 +27,10 @@ class DummyMelloTeleopInterface:
         """Get the fixed joint positions and gripper state as concatenated array."""
         return self.latest_values
 
+    def get_latest_finger_values(self):
+        """Return a fixed dummy finger value for API compatibility."""
+        return [0.0]
+
     def cleanup(self):
         """Dummy cleanup method for API compatibility."""
         pass
@@ -50,6 +54,7 @@ class MelloTeleopInterface:
         # Concatenate joints with gripper value (1 for open, -1 for closed)
         self.latest_values = self.prev_joints + [1]  # Start with gripper open
         self.running = True
+        self.latest_finger_values = [0.0]
         self._start_read_thread()
 
     def _setup_serial(self):
@@ -60,6 +65,7 @@ class MelloTeleopInterface:
                 baudrate=self.baudrate,
                 timeout=1  # 1 second timeout
             )
+            self.serial.reset_input_buffer()  # discard any in-flight partial packet
             print(f"Successfully connected to {self.port}")
         except serial.SerialException as e:
             print(f"Error opening serial port: {e}")
@@ -85,14 +91,16 @@ class MelloTeleopInterface:
                         joints_deg[2] = -1 * joints_deg[2]
                         joints_rad = self._degrees_to_radians(joints_deg)
                         
-                        # Get gripper value (last value)
-                        gripper_value = joint_positions[-1] if len(joint_positions) > 6 else self.prev_gripper
-                        
+                        # Get raw finger joint values (all indices beyond the 6 arm joints)
+                        finger_values = joint_positions[6:] if len(joint_positions) > 6 else [self.prev_gripper]
+                        gripper_value = finger_values[-1] if finger_values else self.prev_gripper
+
                         # Update values if joints are not all zeros
                         if not all(j == 0 for j in joints_rad):
                             self.prev_joints = joints_rad
                         self.prev_gripper = gripper_value
-                        
+                        self.latest_finger_values = list(finger_values)
+
                         # Convert gripper value to 1 (open) or -1 (closed)
                         gripper_state = 1 if gripper_value >= 0 else -1
                         self.latest_values = self.prev_joints + [gripper_state]
@@ -112,6 +120,10 @@ class MelloTeleopInterface:
     def get_latest_values(self):
         """Get the most recent joint and gripper values as concatenated array."""
         return self.latest_values
+
+    def get_latest_finger_values(self):
+        """Get raw continuous finger joint values (before gripper binarization)."""
+        return list(self.latest_finger_values)
 
     def cleanup(self):
         """Clean up resources."""

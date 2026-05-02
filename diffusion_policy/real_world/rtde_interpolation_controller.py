@@ -37,7 +37,7 @@ class RTDEInterpolationController(mp.Process):
                  robot_ip,
                  gripper_port=63352,
                  frequency=500,
-                 launch_timeout=3,
+                 launch_timeout=30,
                  joints_init=None,
                  joints_init_speed=1.05,
                  soft_real_time=False,
@@ -121,6 +121,8 @@ class RTDEInterpolationController(mp.Process):
         for key in receive_keys:
             example[key] = np.array(getattr(rtde_r, 'get'+key)())
         example['robot_receive_timestamp'] = time.time()
+        example['gripper_current'] = np.zeros(1, dtype=np.float64)
+        example['gripper_pos'] = np.zeros(1, dtype=np.float64)
         example['osc_target_pos'] = np.zeros(3, dtype=np.float64)
         example['osc_target_quat'] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         ring_buffer = SharedMemoryRingBuffer.create_from_examples(
@@ -334,6 +336,9 @@ class RTDEInterpolationController(mp.Process):
             current_gripper_state = 'open'
 
             iter_idx = 0
+            gripper_current_poll_interval = max(1, round(self.frequency / 10))
+            last_gripper_current = np.zeros(1, dtype=np.float64)
+            last_gripper_pos = np.zeros(1, dtype=np.float64)
             keep_running = True
             while keep_running:
                 # start control iteration
@@ -372,6 +377,11 @@ class RTDEInterpolationController(mp.Process):
                 for key in self.receive_keys:
                     state[key] = np.array(getattr(rtde_r, 'get'+key)())
                 state['robot_receive_timestamp'] = time.time()
+                if iter_idx % gripper_current_poll_interval == 0:
+                    last_gripper_current = np.array([gripper.get_motor_current()], dtype=np.float64)
+                    last_gripper_pos = np.array([gripper.get_current_position()], dtype=np.float64)
+                state['gripper_current'] = last_gripper_current
+                state['gripper_pos'] = last_gripper_pos
                 state['osc_target_pos'] = current_target_ee_pos.copy()
                 state['osc_target_quat'] = current_target_ee_quat.copy()
                 
