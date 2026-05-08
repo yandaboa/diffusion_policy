@@ -85,10 +85,19 @@ class Sim2RealImageDataset(BaseImageDataset):
                 k for k, v in shape_meta['auxiliary_obs'].items()
             ])
 
+        # Aux supervision targets — separate top-level shape_meta block. Loaded from
+        # ``data/obs/<key>`` in the zarr (same source as obs) but routed to a separate
+        # ``aux_target`` field in the batch so the policy treats them as supervision
+        # signal rather than input. Used by experiment-C (perturbation-reconstruction
+        # aux loss).
+        self.aux_target_keys = []
+        if shape_meta.get('aux_target', None) is not None:
+            self.aux_target_keys = list(shape_meta['aux_target'].keys())
+
         # Create key_first_k for performance optimization
         key_first_k = dict()
         if n_obs_steps is not None:
-            for key in self.rgb_keys + self.lowdim_keys + self.depth_keys:
+            for key in self.rgb_keys + self.lowdim_keys + self.depth_keys + self.aux_target_keys:
                 key_first_k[key] = n_obs_steps
 
         # Split train/val
@@ -313,6 +322,15 @@ class Sim2RealImageDataset(BaseImageDataset):
             'action': torch.from_numpy(action),
             'expert_mask': torch.from_numpy(expert_mask),
         }
+
+        # Aux targets, if any (e.g. action_offset / action_scale for the
+        # perturbation-reconstruction aux loss). Same time-slicing as obs.
+        if self.aux_target_keys:
+            aux_dict = {}
+            for key in self.aux_target_keys:
+                aux_dict[key] = data[key][T_slice].astype(np.float32)
+                del data[key]
+            torch_data['aux_target'] = dict_apply(aux_dict, torch.from_numpy)
 
         # Include rolled-out reward / done when the underlying zarr provided
         # them. Consumed by policies that condition on reward history.

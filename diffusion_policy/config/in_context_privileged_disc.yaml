@@ -1,0 +1,144 @@
+defaults:
+  - _self_
+  - task: sim2real_arm_dynamics_privileged_known
+
+# Privileged discrete-AR baseline. Same architecture as the headline ASTEROID
+# disc-AR (`in_context_adaptation_interleave.yaml`) but the student observes
+# (action_offset, action_scale) directly via the privileged_known shape_meta.
+# Apples-to-apples comparison against r4 (markovian-disc, no priv obs) — if
+# privileged disc-AR ≫ markovian disc-AR, perturbation params *do* help when
+# the head can express the conditional joint over actions.
+
+name: in-context-privileged-disc
+_target_: diffusion_policy.workspace.train_mlp_image_workspace.TrainMLPImageWorkspace
+output_dir: null
+
+task_name: '${task.name}'
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+horizon: 1024
+n_obs_steps: 1
+n_action_steps: 1
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+seed: null
+iteration: null
+
+task:
+  dataset:
+    return_sequences: true
+
+policy:
+  _target_: diffusion_policy.policy.interleaved_transformer_image_policy.InterleavedTransformerImagePolicy
+  shape_meta: ${shape_meta}
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+    rgb_model:
+      _target_: diffusion_policy.model.vision.model_getter.get_resnet
+      name: resnet18
+      weights: IMAGENET1K_V1
+    resize_shape: null
+    crop_shape: null
+    random_crop: False
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  hidden_dim: 512
+  hidden_depth: 6
+  n_head: 8
+  dropout: 0.1
+
+  include_action_in_context: True
+  include_reward_in_context: False
+
+  head_type: discrete_ar
+  num_bins: 100
+  clip_val: 50.0
+  gripper_dim: 6
+  output_head: null
+
+dataloader:
+  batch_size: 16
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 4
+  drop_last: False
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 16
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 8
+  drop_last: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda"
+  seed: ${seed}
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 20
+  gradient_accumulate_every: 1
+  gradient_clip_norm: 1.0
+  use_ema: False
+  freeze_encoder: False
+  rollout_every: 5000
+  checkpoint_every: 1000
+  val_every: 1
+  sample_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  max_gradient_steps: 50000
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: incontext_priv_baseline
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: "priv_disc"
+
+checkpoint:
+  topk:
+    monitor_key: train_action_mse_error
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-train_action_mse_error={train_action_mse_error:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+  pretrained_ckpt_path: null
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

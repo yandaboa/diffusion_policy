@@ -67,6 +67,8 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
             num_bins: int = 20,
             clip_val: float = 50.0,
             gripper_dim: int = 6,
+            aux_perturbation_dim: int = 0,
+            aux_weight: float = 0.0,
             **kwargs):
         assert n_action_steps == 1, "MLPImagePolicy only supports n_action_steps=1"
 
@@ -148,6 +150,18 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
         # exploration) vs greedy argmax / threshold (eval). Set externally by
         # the wrapper at construction time and persisted across calls.
         self.sample_action: bool = False
+
+        # Auxiliary perturbation-reconstruction head: predicts a
+        # ``aux_perturbation_dim``-d target (typically [action_offset(6),
+        # action_scale(6)]) from the obs-token hidden state at the last valid
+        # timestep. Loss is added with weight ``aux_weight``. When
+        # ``aux_perturbation_dim == 0`` the head and loss term are no-ops.
+        self.aux_perturbation_dim = int(aux_perturbation_dim)
+        self.aux_weight = float(aux_weight)
+        if self.aux_perturbation_dim > 0:
+            self.aux_head = nn.Linear(hidden_dim, self.aux_perturbation_dim)
+        else:
+            self.aux_head = None
 
     # ------------------------------------------------------------------
     # Interleaving helpers
@@ -589,6 +603,30 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
+    def _aux_loss(self, h: torch.Tensor, batch: dict, loss_mask: torch.Tensor) -> torch.Tensor:
+        """Perturbation-reconstruction aux loss.
+
+        Concatenates ``batch['aux_target']`` keys in their dict order into a
+        ``(B, T, aux_perturbation_dim)`` tensor, projects ``h`` through
+        ``aux_head``, and returns mean MSE over masked timesteps.
+        """
+        if self.aux_head is None or self.aux_weight <= 0.0:
+            return h.new_zeros(())
+        aux_target = batch.get('aux_target', None)
+        if aux_target is None:
+            return h.new_zeros(())
+        # Concatenate aux target keys along last dim. dict order is preserved by
+        # the dataset (it iterates ``aux_target_keys``), and the policy's
+        # aux_perturbation_dim must equal the resulting concat width.
+        target = torch.cat([aux_target[k] for k in aux_target.keys()], dim=-1)  # (B, T, D_aux)
+        assert target.shape[-1] == self.aux_perturbation_dim, (
+            f"aux_target concat dim {target.shape[-1]} != aux_perturbation_dim {self.aux_perturbation_dim}"
+        )
+        pred = self.aux_head(h)  # (B, T, D_aux)
+        sqerr = (pred - target).pow(2).mean(dim=-1)  # (B, T)
+        denom = loss_mask.sum().clamp_min(1.0)
+        return (sqerr * loss_mask).sum() / denom
+
     def compute_loss(self, batch):
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
@@ -613,6 +651,7 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
             action=action, reward=reward,
         )
         loss_mask = expert_mask[..., 0] * attention_mask  # (B, T)
+        aux_loss_term = self._aux_loss(h, batch, loss_mask)
 
         if self.head_type == "discrete_ar":
             # Second trunk forward over the AR sequence (teacher-forced); since
@@ -628,7 +667,7 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
 
             mask_flat = loss_mask.reshape(-1).bool()
             if mask_flat.sum() == 0:
-                return h.sum() * 0.0
+                return h.sum() * 0.0 + self.aux_weight * aux_loss_term
             h_flat = h.reshape(-1, h.shape[-1])[mask_flat]  # (N, H)
             tb_flat = target_bins.reshape(-1, self.action_dim)[mask_flat]  # (N, D)
 
@@ -637,8 +676,10 @@ class InterleavedTransformerImagePolicy(TransformerImagePolicy):
             per_dim_hidden = h.new_zeros(B * T, self.action_dim, h.shape[-1])
             per_dim_hidden[mask_flat] = ar_h
             per_dim_hidden = per_dim_hidden.reshape(B, T, self.action_dim, h.shape[-1])
-            return self.output_head.compute_loss_from_per_dim_hidden(
+            primary = self.output_head.compute_loss_from_per_dim_hidden(
                 per_dim_hidden, target_bins, loss_mask
             )
+            return primary + self.aux_weight * aux_loss_term
 
-        return self.output_head.compute_loss(h, nactions, loss_mask)
+        primary = self.output_head.compute_loss(h, nactions, loss_mask)
+        return primary + self.aux_weight * aux_loss_term

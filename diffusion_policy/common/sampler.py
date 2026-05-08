@@ -110,6 +110,12 @@ def collate_fn(batch):
     if 'expert_obs' in batch[0]:
         collated_batch['expert_obs'] = _collate(
             [item['expert_obs'] for item in batch])
+    if 'aux_target' in batch[0]:
+        aux_dict = {
+            key: [item['aux_target'][key] for item in batch]
+            for key in batch[0]['aux_target'].keys()
+        }
+        collated_batch['aux_target'] = dict_apply(aux_dict, lambda x: _collate(x))
 
     return collated_batch
 
