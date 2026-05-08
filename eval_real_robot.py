@@ -44,6 +44,7 @@ from diffusion_policy.real_world.real_inference_util import (
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
+from diffusion_policy.policy.transformer_image_policy import TransformerImagePolicy
 
 # Add imageio import for video saving
 import imageio
@@ -72,6 +73,34 @@ def compute_binary_contact(tcp_force, threshold):
     force_norm = np.linalg.norm(tcp_force[:, :3], axis=-1)
     contact = (force_norm > threshold).astype(np.float32)
     return contact[:, None]
+
+
+def build_policy_input(obs_dict_np, obs_history, policy, device, max_history):
+    """Construct the obs dict to feed `policy.predict_action`.
+
+    For ``TransformerImagePolicy`` (ASTEROID in-context model), accumulates a
+    rolling per-episode history of observations and emits a (1, T, *) sequence
+    tensor + (1, T) ``attention_mask``. Caller must clear ``obs_history`` on
+    every ``policy.reset()`` to start a fresh in-context trajectory.
+
+    For all other policies, falls back to the standard single-step
+    ``unsqueeze(0)`` path that yields (1, n_obs_steps, *) per key.
+    """
+    if isinstance(policy, TransformerImagePolicy):
+        for k, v in obs_dict_np.items():
+            # v shape: (n_obs_steps, *) from get_real_obs_dict; keep most recent frame.
+            obs_history.setdefault(k, []).append(v[-1])
+            if len(obs_history[k]) > max_history:
+                obs_history[k].pop(0)
+        T = len(next(iter(obs_history.values())))
+        seq = {}
+        for k, hist in obs_history.items():
+            arr = np.stack(hist, axis=0)[None]  # (1, T, *)
+            seq[k] = torch.from_numpy(arr).to(device)
+        seq['attention_mask'] = torch.ones((1, T), dtype=torch.long, device=device)
+        return seq
+    return dict_apply(obs_dict_np,
+        lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
 
 
 def compute_calibrated_ee_pose(joint_positions):
@@ -200,10 +229,18 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
     policy.eval().to(device)
 
-    # Diffusion-specific overrides (no-op for MLP policies)
+    # Diffusion-specific overrides (no-op for MLP / Transformer policies)
     if hasattr(policy, 'num_inference_steps'):
         policy.num_inference_steps = 16  # DDIM inference iterations
         policy.n_action_steps = policy.horizon - policy.n_obs_steps + 1
+
+    # In-context (TransformerImagePolicy) needs per-episode obs history.
+    # Cap at training horizon so we never overflow GPT2 positional embeddings.
+    is_in_context = isinstance(policy, TransformerImagePolicy)
+    obs_history = {}
+    in_context_max_history = int(cfg.get('horizon', 256))
+    if is_in_context:
+        print(f"In-context policy detected; obs history capped at {in_context_max_history} steps.")
 
     # setup experiments
     dt = 1/frequency
@@ -251,10 +288,12 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
             with torch.no_grad():
                 policy.reset()
+                obs_history.clear()
                 obs_dict_np = get_real_obs_dict(
                     env_obs=obs, shape_meta=cfg['shape_meta'])
-                obs_dict = dict_apply(obs_dict_np,
-                    lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                obs_dict = build_policy_input(
+                    obs_dict_np, obs_history, policy, device,
+                    in_context_max_history)
                 try:
                     result = policy.predict_action(obs_dict)
                     action = result['action'][0].detach().to('cpu').numpy()
@@ -294,6 +333,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 try:
                     # start episode
                     policy.reset()
+                    obs_history.clear()
                     start_delay = 1.0
                     eval_t_start = time.time() + start_delay
                     t_start = time.monotonic() + start_delay
@@ -344,8 +384,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             obs_dict_np = get_real_obs_dict(
                                 env_obs=obs, shape_meta=cfg['shape_meta']
                             )
-                            obs_dict = dict_apply(obs_dict_np,
-                                lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                            obs_dict = build_policy_input(
+                                obs_dict_np, obs_history, policy, device,
+                                in_context_max_history)
                             result = policy.predict_action(obs_dict)
                             action = result['action'][0:1].detach().to('cpu').numpy()
                         
@@ -465,6 +506,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             
                             # Reset policy state
                             policy.reset()
+                            obs_history.clear()
                             
                             # Move robot to initial position
                             env.robot.reset_to_initial_position()

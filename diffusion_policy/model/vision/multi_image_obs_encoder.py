@@ -265,10 +265,43 @@ class MultiImageObsEncoder(ModuleAttrMixin):
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
             this_obs = torch.zeros(
-                (batch_size,) + shape, 
+                (batch_size,) + shape,
                 dtype=self.dtype,
                 device=self.device)
             example_obs_dict[key] = this_obs
         example_output = self.forward(example_obs_dict)
         output_shape = example_output.shape[1:]
         return output_shape
+
+
+class FlattenObsEncoder(nn.Module):
+    """flattens each tensor in the input dict and concatenates them."""
+
+    def __init__(self, shape_meta):
+        super().__init__()
+        self.shape_meta = shape_meta
+        self.keys = list(shape_meta['obs'].keys()) if shape_meta is not None else None
+
+    def forward(self, obs_dict: dict) -> torch.Tensor:
+        keys = self.keys or sorted(obs_dict.keys())
+        batch_size = None
+        parts = []
+        for k in keys:
+            t = obs_dict[k]
+            if batch_size is None:
+                batch_size = t.shape[0]
+            else:
+                assert t.shape[0] == batch_size, f"batch size mismatch for key {k}"
+            parts.append(t.reshape(batch_size, -1))
+        if not parts:
+            return torch.zeros((0, 0))
+        return torch.cat(parts, dim=1)
+
+    @torch.no_grad()
+    def output_shape(self) -> tuple:
+        """Given shape_meta like in original file, return flattened output shape (features,)."""
+        total = 0
+        for k, attr in self.shape_meta['obs'].items():
+            shape = tuple(attr['shape'])
+            total += int(torch.tensor(shape).prod().item())
+        return (total,)
