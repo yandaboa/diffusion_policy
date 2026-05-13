@@ -68,6 +68,8 @@ class RealEnv:
             # vis params
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(640,480),
+            # depth
+            enable_depth=False,
             # shared memory
             shm_manager=None,
             rescale_pixels=True,
@@ -145,7 +147,7 @@ class RealEnv:
             record_fps=recording_fps,
             advanced_mode_config=camera_configs,
             enable_color=True,
-            enable_depth=False,
+            enable_depth=enable_depth,
             enable_infrared=False,
             get_max_k=max_obs_buffer_size,
             transform=transform,

@@ -22,6 +22,37 @@ from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
 )
 from diffusion_policy.real_world.mello_teleop import MelloTeleopInterface, DummyMelloTeleopInterface
+from diffusion_policy.real_world.da3_depth_client import DA3DepthClient
+
+# ── Depth constants matching depth_dagger_cfg.py ────────────────────────────
+_DEPTH_CLIP = (0.01, 2.0)   # metres
+_DEPTH_IMG_H, _DEPTH_IMG_W = 224, 224
+
+# Camera order in RealEnv: 0=front, 1=side, 2=wrist
+_SIDE_SERIAL  = '832112070487'
+_WRIST_SERIAL = '746112060198'
+
+
+
+def _process_depth(depth_u16: np.ndarray, depth_scale: float) -> np.ndarray:
+    """uint16 depth frame → float32 [0,1] at 224×224, matching sim preprocessing."""
+    d_min, d_max = _DEPTH_CLIP
+    depth_m = depth_u16.astype(np.float32) * depth_scale
+    depth_m[depth_m == 0.0] = d_max          # no-return pixels → max range
+    np.clip(depth_m, d_min, d_max, out=depth_m)
+    depth_norm = (depth_m - d_min) / (d_max - d_min)
+    return cv2.resize(depth_norm, (_DEPTH_IMG_W, _DEPTH_IMG_H), interpolation=cv2.INTER_LINEAR)
+
+
+def _depth_to_bgr(depth_norm: np.ndarray) -> np.ndarray:
+    """float32 [0,1] → BGR uint8 via TURBO colormap."""
+    return cv2.applyColorMap((depth_norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+
+
+def _metric_to_bgr(depth_m: np.ndarray, d_max: float = 3.0) -> np.ndarray:
+    """float32 metres → BGR uint8 via TURBO colormap, clipped to [0, d_max]."""
+    norm = np.clip(depth_m / d_max, 0.0, 1.0)
+    return cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
 
 
 @click.command()
@@ -50,10 +81,11 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
     with SharedMemoryManager() as shm_manager:
         MelloInterface = DummyMelloTeleopInterface if debug else MelloTeleopInterface
         mello_kwargs = {} if debug else {'port': mello_port}
-        with KeystrokeCounter() as key_counter, \
-            MelloInterface(**mello_kwargs) as mello, \
+        with DA3DepthClient(device=0) as da3_client, \
+             KeystrokeCounter() as key_counter, \
+             MelloInterface(**mello_kwargs) as mello, \
             RealEnv(
-                output_dir=output, 
+                output_dir=output,
                 robot_ip=robot_ip,
                 obs_image_resolution=(640,480),
                 camera_serial_numbers=['215122255213', '832112070487',
@@ -62,6 +94,7 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 frequency=frequency,
                 init_joints=init_joints,
                 enable_multi_cam_vis=False,
+                enable_depth=True,
                 record_raw_video=True,
                 thread_per_video=3,
                 video_crf=21,
@@ -82,6 +115,54 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
             kd_rot = 2 * np.sqrt(osc_kp_rot) * 1.0
             print(f'OSC: Kp_pos={osc_kp_pos}, Kp_rot={osc_kp_rot}, Kd_pos={kd_pos:.1f}, Kd_rot={kd_rot:.1f}')
             print('Ready!')
+
+            print('Waiting for DA3 model to be ready (loading in background)...')
+            da3_client.wait_ready(timeout=120.0)
+            print('DA3 model ready.')
+
+            # Depth scales and intrinsics — read once after cameras are ready
+            _side_depth_scale  = env.realsense.cameras[_SIDE_SERIAL].get_depth_scale()
+            _wrist_depth_scale = env.realsense.cameras[_WRIST_SERIAL].get_depth_scale()
+            _side_K  = env.realsense.cameras[_SIDE_SERIAL].get_intrinsics()
+            _wrist_K = env.realsense.cameras[_WRIST_SERIAL].get_intrinsics()
+            _SIDE_FOCAL_PX  = float(_side_K[0, 0] + _side_K[1, 1]) / 2.0
+            _WRIST_FOCAL_PX = float(_wrist_K[0, 0] + _wrist_K[1, 1]) / 2.0
+            print(f'Depth scales — side: {_side_depth_scale:.5f}, wrist: {_wrist_depth_scale:.5f}')
+            print(f'Focal lengths — side: {_SIDE_FOCAL_PX:.1f} px, wrist: {_WRIST_FOCAL_PX:.1f} px')
+            cv2.namedWindow('Depth', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Depth', _DEPTH_IMG_W * 2, _DEPTH_IMG_H)
+
+            # Depth video writer — saves side|wrist panel to output dir
+            _depth_video_path = output + '/depth_preview.mp4'
+            _depth_writer = cv2.VideoWriter(
+                _depth_video_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                frequency,
+                (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
+            )
+            print(f'Depth video → {_depth_video_path}')
+
+            # DA3-fused depth video writer (separate file, same dimensions)
+            _fused_video_path = output + '/da3_fused_depth.mp4'
+            _fused_writer = cv2.VideoWriter(
+                _fused_video_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                frequency,
+                (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
+            )
+            print(f'DA3 fused depth video → {_fused_video_path}')
+
+            # DA3-fused depth video without colour overlay (pure depth colourmap)
+            _fused_raw_video_path = output + '/da3_fused_depth_raw.mp4'
+            _fused_raw_writer = cv2.VideoWriter(
+                _fused_raw_video_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                frequency,
+                (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
+            )
+            print(f'DA3 fused depth (raw) video → {_fused_raw_video_path}')
+            cv2.namedWindow('DA3 Fused Depth', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('DA3 Fused Depth', _DEPTH_IMG_W * 2, _DEPTH_IMG_H)
             t_start = time.monotonic()
             iter_idx = 0
             stop = False
@@ -96,6 +177,10 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 t_command_target = t_cycle_end + dt
 
                 obs = env.get_obs()
+
+                # Fire off DA3 inference now; collect results after visualization
+                # so the ~43 ms model forward pass overlaps with other loop work.
+                da3_client.submit(obs['side_rgb'][-1], obs['wrist_rgb'][-1])
 
                 press_events = key_counter.get_press_events()
                 for key_stroke in press_events:
@@ -146,6 +231,60 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                     color=(0, 255, 255)
                 )
                 cv2.imshow('default', vis_img)
+
+                # ── Depth visualisation (side | wrist) with colour overlay ──
+                if env.last_realsense_data is not None:
+                    side_raw  = env.last_realsense_data[1].get('depth')
+                    wrist_raw = env.last_realsense_data[2].get('depth')
+                    if side_raw is not None and wrist_raw is not None:
+                        side_vis  = _depth_to_bgr(_process_depth(side_raw[-1],  _side_depth_scale))
+                        wrist_vis = _depth_to_bgr(_process_depth(wrist_raw[-1], _wrist_depth_scale))
+                        # Blend colour image over depth colourmap (50/50)
+                        # obs images are RGB uint8; convert to BGR and resize to 224×224
+                        side_color  = cv2.resize(obs['side_rgb'][-1][:, :, ::-1],  (_DEPTH_IMG_W, _DEPTH_IMG_H))
+                        wrist_color = cv2.resize(obs['wrist_rgb'][-1][:, :, ::-1], (_DEPTH_IMG_W, _DEPTH_IMG_H))
+                        side_vis  = cv2.addWeighted(side_vis,  0.5, side_color,  0.5, 0)
+                        wrist_vis = cv2.addWeighted(wrist_vis, 0.5, wrist_color, 0.5, 0)
+                        cv2.putText(side_vis,  'SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                        cv2.putText(wrist_vis, 'WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                        depth_panel = np.concatenate([side_vis, wrist_vis], axis=1)
+                        cv2.imshow('Depth', depth_panel)
+                        _depth_writer.write(depth_panel)
+
+                # ── DA3 fused depth (collect result submitted above) ─────────
+                _da3_side_raw, _da3_wrist_raw = da3_client.collect()
+                _da3_side_m  = DA3DepthClient.to_metric(_da3_side_raw,  _SIDE_FOCAL_PX)
+                _da3_wrist_m = DA3DepthClient.to_metric(_da3_wrist_raw, _WRIST_FOCAL_PX)
+                if env.last_realsense_data is not None:
+                    _rs_side  = env.last_realsense_data[1].get('depth')
+                    _rs_wrist = env.last_realsense_data[2].get('depth')
+                    if _rs_side is not None and _rs_wrist is not None:
+                        _fused_side  = DA3DepthClient.fuse_with_realsense(
+                            _da3_side_m,  _rs_side[-1],  _side_depth_scale)
+                        _fused_wrist = DA3DepthClient.fuse_with_realsense(
+                            _da3_wrist_m, _rs_wrist[-1], _wrist_depth_scale)
+                        _fsv = cv2.resize(
+                            _metric_to_bgr(_fused_side),  (_DEPTH_IMG_W, _DEPTH_IMG_H))
+                        _fwv = cv2.resize(
+                            _metric_to_bgr(_fused_wrist), (_DEPTH_IMG_W, _DEPTH_IMG_H))
+                        # Raw video: depth colourmap only, written before RGB blend
+                        _fused_raw_panel = np.concatenate([_fsv, _fwv], axis=1)
+                        _fused_raw_writer.write(_fused_raw_panel)
+                        # Overlay video: blend RGB over depth colourmap
+                        _sc  = cv2.resize(obs['side_rgb'][-1][:, :, ::-1],
+                                          (_DEPTH_IMG_W, _DEPTH_IMG_H))
+                        _wc  = cv2.resize(obs['wrist_rgb'][-1][:, :, ::-1],
+                                          (_DEPTH_IMG_W, _DEPTH_IMG_H))
+                        _fsv = cv2.addWeighted(_fsv, 0.5, _sc, 0.5, 0)
+                        _fwv = cv2.addWeighted(_fwv, 0.5, _wc, 0.5, 0)
+                        cv2.putText(_fsv,  'SIDE (fused)',  (5, 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                        cv2.putText(_fwv, 'WRIST (fused)', (5, 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                        _fused_panel = np.concatenate([_fsv, _fwv], axis=1)
+                        cv2.imshow('DA3 Fused Depth', _fused_panel)
+                        _fused_writer.write(_fused_panel)
+
                 cv2.pollKey()
 
                 precise_wait(t_sample)
@@ -166,6 +305,13 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                     stages=[stage])
                 precise_wait(t_cycle_end)
                 iter_idx += 1
+
+            _depth_writer.release()
+            print(f'Depth video saved → {_depth_video_path}')
+            _fused_writer.release()
+            print(f'DA3 fused depth video saved → {_fused_video_path}')
+            _fused_raw_writer.release()
+            print(f'DA3 fused depth (raw) video saved → {_fused_raw_video_path}')
 
             # Plot inner_finger_knuckle_joint after session ends
             if finger_log:
