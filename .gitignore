@@ -148,3 +148,5 @@ depth_testing/
 gripper/
 tactile/
 experiments/
+tmp/
+tactile_asteroid_0/

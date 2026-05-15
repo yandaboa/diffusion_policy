@@ -67,7 +67,7 @@ conda activate robodiff_real
 cd /mnt/storage/lti/diffusion_policy
 python eval_real_robot_depth.py \
   -i <ckpt-dir>/exported/depth_policy.pt \
-  -o /tmp/depth_eval_$(date +%s) \
+  -o tmp/depth_eval_$(date +%s) \
   --robot_ip <ur5e-ip> \
   --save_video
 ```

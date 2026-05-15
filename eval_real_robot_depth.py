@@ -37,7 +37,7 @@ import skvideo.io
 from diffusion_policy.real_world.real_env import RealEnv
 from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
 from diffusion_policy.common.precise_sleep import precise_wait
-from diffusion_policy.real_world.da3_depth_client import DA3DepthClient
+from diffusion_policy.real_world.da3_depth_client import DA3DepthClient, DA3DepthBackground
 
 # Add imageio import for video saving
 import imageio
@@ -128,6 +128,37 @@ def _process_metric_depth(depth_m: np.ndarray) -> np.ndarray:
 def _depth_to_bgr(depth_norm: np.ndarray) -> np.ndarray:
     """float32 [0,1] → BGR uint8 via TURBO colormap (matches demo_real_robot.py)."""
     return cv2.applyColorMap((depth_norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+
+
+def _metric_to_bgr(depth_m: np.ndarray, out_wh: tuple[int, int]) -> np.ndarray:
+    """float32 metric depth (metres) → BGR uint8 via TURBO, resized to out_wh (W, H)."""
+    d_min, d_max = DEPTH_CLIP
+    depth = np.nan_to_num(depth_m, nan=d_max, posinf=d_max, neginf=d_max).astype(np.float32)
+    depth = np.clip(depth, d_min, d_max)
+    norm = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+    if norm.shape[:2][::-1] != out_wh:
+        norm = cv2.resize(norm, out_wh, interpolation=cv2.INTER_LINEAR)
+    return cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
+
+def _ee_to_w2c(pos: np.ndarray, quat_wxyz: np.ndarray,
+               cam_in_ee: np.ndarray) -> np.ndarray:
+    """Compute world-to-camera 4×4 from FK output + camera-in-wrist offset.
+
+    Args:
+        pos:        (3,) wrist_3_link position in base frame.
+        quat_wxyz:  (4,) quaternion [w, x, y, z] from get_ee_pose().
+        cam_in_ee:  (4, 4) camera-to-wrist_3_link transform (calibration file).
+
+    Returns: (4, 4) world-to-camera matrix, float64.
+    """
+    w, x, y, z = quat_wxyz
+    R_ee = R.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
+    T_ee = np.eye(4, dtype=np.float64)
+    T_ee[:3, :3] = R_ee
+    T_ee[:3,  3] = pos
+    T_cam = T_ee @ cam_in_ee          # camera-in-world
+    return np.linalg.inv(T_cam)       # world-to-camera
 
 
 def compute_calibrated_ee_pose(joint_positions: np.ndarray) -> np.ndarray:
@@ -233,16 +264,53 @@ def _load_jit_metadata(jit_path: str) -> dict:
               help='Save on-policy sysid data to .pt file (joint traj + OSC targets)')
 @click.option('--use_da3_fusion/--no_da3_fusion', default=True,
               help='Use DA3 metric depth fusion with RealSense (better at hole-y/specular pixels).')
+@click.option('--da3_only', is_flag=True, default=False,
+              help='Feed raw DA3 metric depth to the policy, skipping RealSense entirely (implies DA3 is used).')
+@click.option('--use_nested', is_flag=True, default=False,
+              help='Use DA3NESTED-GIANT-LARGE (multi-view history=2) instead of DA3METRIC-LARGE.')
+@click.option('--da3_process_res', default=378, type=int, show_default=True,
+              help='DA3NESTED processing resolution (252=~78ms, 378=~146ms, 504=~241ms on RTX4090).')
+@click.option('--wrist_cam_extrinsic', default=None, type=str,
+              help='Path to (4,4) float64 .npy: camera-to-wrist_3_link transform (for pose conditioning).')
+@click.option('--side_cam_extrinsic', default=None, type=str,
+              help='Path to (4,4) float64 .npy: world-to-side-camera transform (for pose conditioning).')
 @click.option('--torch_device', default='cuda', type=str,
               help='Torch device for JIT inference.')
 def main(input, output, robot_ip, match_dataset, match_episode,
          vis_camera_idx, init_joints, max_duration,
          frequency, save_video, action_noise,
-         collect_sysid, use_da3_fusion, torch_device):
+         collect_sysid, use_da3_fusion, da3_only,
+         use_nested, da3_process_res, wrist_cam_extrinsic, side_cam_extrinsic,
+         torch_device):
     # Per-axis Cartesian scale matching simulation DiffIK config.
     # Identical to eval_real_robot.py — sim's RelCartesianOSCEvalAction scales.
     CARTESIAN_SCALE = np.array([0.01, 0.01, 0.002, 0.02, 0.02, 0.2])
     print(f"Cartesian OSC scale: {CARTESIAN_SCALE}")
+    if da3_only:
+        use_da3_fusion = True
+        print("[da3_only] Bypassing RealSense — feeding raw DA3 metric depth to policy.")
+    if use_nested:
+        use_da3_fusion = True
+        print("[use_nested] DA3NESTED-GIANT-LARGE enabled (multi-view history=2).")
+
+    # Select DA3 model and load optional pose-conditioning calibration matrices
+    da3_model_id = ('depth-anything/DA3NESTED-GIANT-LARGE' if use_nested
+                    else 'depth-anything/DA3METRIC-LARGE')
+
+    wrist_cam_T: 'np.ndarray | None' = None   # camera-in-wrist_3_link (4×4)
+    side_cam_w2c: 'np.ndarray | None' = None  # world-to-side-cam (4×4)
+    if use_nested and wrist_cam_extrinsic:
+        wrist_cam_T = np.load(wrist_cam_extrinsic).astype(np.float64)
+        assert wrist_cam_T.shape == (4, 4), "--wrist_cam_extrinsic must be (4,4)"
+        print(f"[pose] Wrist cam-in-EE transform loaded from {wrist_cam_extrinsic}")
+    if use_nested and side_cam_extrinsic:
+        side_cam_w2c = np.load(side_cam_extrinsic).astype(np.float64)
+        assert side_cam_w2c.shape == (4, 4), "--side_cam_extrinsic must be (4,4)"
+        print(f"[pose] Side world-to-cam transform loaded from {side_cam_extrinsic}")
+
+    use_pose = use_nested and (wrist_cam_T is not None) and (side_cam_w2c is not None)
+    if use_nested and not use_pose:
+        print("[pose] No extrinsic files provided — running NESTED without pose conditioning.")
 
     sysid_records = []  # list of (joint_pos, target_pos, target_quat)
 
@@ -314,8 +382,16 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     print(f"n_obs_steps (matches HISTORY_LEN): {n_obs_steps}")
     print("Policy outputs single-step actions (n_action_steps=1)")
 
+    side_depth_mean = 0.0
+    side_depth_std = 0.0
+    wrist_depth_mean = 0.0
+    wrist_depth_std = 0.0
+    timestep = 0
+
+    pathlib.Path(output).mkdir(parents=True, exist_ok=True)
     with SharedMemoryManager() as shm_manager:
-        with DA3DepthClient(device=0) as da3_client, \
+        with DA3DepthClient(device=0, model_id=da3_model_id,
+                            process_res=da3_process_res if use_nested else None) as da3_client, \
              Spacemouse(shm_manager=shm_manager) as sm, \
              RealEnv(
                 output_dir=output,
@@ -342,8 +418,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             time.sleep(5.0)
 
             if use_da3_fusion:
-                print("Waiting for DA3 model to be ready (loading in background)...")
-                da3_client.wait_ready(timeout=120.0)
+                _ready_timeout = 180.0 if use_nested else 120.0
+                print(f"Waiting for DA3 model to be ready (timeout={_ready_timeout:.0f}s)...")
+                da3_client.wait_ready(timeout=_ready_timeout)
                 print('DA3 model ready.')
 
             # Depth scales + intrinsics — read once after cameras are ready.
@@ -356,8 +433,24 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             print(f'Depth scales — side: {side_depth_scale:.5f}, wrist: {wrist_depth_scale:.5f}')
             print(f'Focal lengths — side: {SIDE_FOCAL_PX:.1f} px, wrist: {WRIST_FOCAL_PX:.1f} px')
 
+            # For NESTED, push intrinsics into shared memory once (used for pose conditioning)
+            if use_nested and use_da3_fusion:
+                da3_client.set_intrinsics(side_K, wrist_K)
+
+            # ── DA3 background inference thread ───────────────────────────
+            # Continuously processes queued RGB frames so the control loop
+            # can read pre-computed depth without blocking on DA3 inference.
+            da3_bg: DA3DepthBackground | None = None
+            if use_da3_fusion:
+                da3_bg = DA3DepthBackground(da3_client, SIDE_FOCAL_PX, WRIST_FOCAL_PX)
+                da3_bg.start()
+                print('DA3 background inference thread started.')
+
             # ── Depth video writer (mirrors demo_real_robot.py panels) ─────
             depth_video_writer = None
+            depth_raw_video_writer = None
+            rs_debug_video_writer = None
+            da3_debug_video_writer = None
             if save_video:
                 cv2.namedWindow('Depth (policy input)', cv2.WINDOW_NORMAL)
                 cv2.resizeWindow('Depth (policy input)', DEPTH_IMG_W * 2, DEPTH_IMG_H)
@@ -369,6 +462,31 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     (DEPTH_IMG_W * 2, DEPTH_IMG_H),
                 )
                 print(f'Policy-input depth video → {depth_video_path}')
+                depth_raw_video_path = pathlib.Path(output) / 'policy_depth_raw.mp4'
+                depth_raw_video_writer = cv2.VideoWriter(
+                    str(depth_raw_video_path),
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    int(frequency),
+                    (DEPTH_IMG_W * 2, DEPTH_IMG_H),
+                )
+                print(f'Policy-input raw depth video → {depth_raw_video_path}')
+                rs_debug_path = pathlib.Path(output) / 'debug_realsense_raw.mp4'
+                rs_debug_video_writer = cv2.VideoWriter(
+                    str(rs_debug_path),
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    int(frequency),
+                    (DEPTH_IMG_W * 2, DEPTH_IMG_H),
+                )
+                print(f'RealSense raw depth video → {rs_debug_path}')
+                if use_da3_fusion:
+                    da3_debug_path = pathlib.Path(output) / 'debug_da3_metric.mp4'
+                    da3_debug_video_writer = cv2.VideoWriter(
+                        str(da3_debug_path),
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        int(frequency),
+                        (DEPTH_IMG_W * 2, DEPTH_IMG_H),
+                    )
+                    print(f'DA3 metric depth video → {da3_debug_path}')
 
             # ── Warm up policy with current obs (no inference latency in step 0) ──
             print("Warming up policy inference")
@@ -453,10 +571,17 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         # Override EE pose with calibrated FK (wrist_3_link in REP-103 frame)
                         obs['end_effector_pose'] = compute_calibrated_ee_pose(obs['arm_joint_pos'])
 
-                        # ── Submit DA3 inference now; collect after viz so the
-                        # ~43 ms forward overlaps with the rest of the loop. ──
+                        # ── Queue latest frames for background DA3 inference ──
                         if use_da3_fusion:
-                            da3_client.submit(obs['side_rgb'][-1], obs['wrist_rgb'][-1])
+                            _side_E = _wrist_E = None
+                            if use_pose:
+                                _arm_jp = obs['arm_joint_pos'][-1]
+                                _pos_ee, _quat_ee = get_ee_pose(_arm_jp)
+                                _wrist_E = _ee_to_w2c(_pos_ee, _quat_ee, wrist_cam_T)
+                                _side_E  = side_cam_w2c
+                            da3_bg.put_frame(obs['side_rgb'][-1], obs['wrist_rgb'][-1],
+                                             side_extrinsic=_side_E,
+                                             wrist_extrinsic=_wrist_E)
 
                         # Capture concatenated RGB frames if recording
                         if save_video:
@@ -483,14 +608,23 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         if rs_side is None or rs_wrist is None:
                             raise RuntimeError("Depth frames missing from realsense buffer.")
 
+                        da3_side_m = da3_wrist_m = None
                         if use_da3_fusion:
-                            da3_side_raw, da3_wrist_raw = da3_client.collect()
-                            da3_side_m  = DA3DepthClient.to_metric(da3_side_raw,  SIDE_FOCAL_PX)
-                            da3_wrist_m = DA3DepthClient.to_metric(da3_wrist_raw, WRIST_FOCAL_PX)
-                            fused_side  = DA3DepthClient.fuse_with_realsense(da3_side_m,  rs_side[-1],  side_depth_scale)
-                            fused_wrist = DA3DepthClient.fuse_with_realsense(da3_wrist_m, rs_wrist[-1], wrist_depth_scale)
-                            side_norm  = _process_metric_depth(fused_side)
-                            wrist_norm = _process_metric_depth(fused_wrist)
+                            _da3_result = da3_bg.get_latest_da3()
+                            if _da3_result is not None:
+                                da3_side_m, da3_wrist_m, _ = _da3_result
+                                if da3_only:
+                                    side_norm  = _process_metric_depth(da3_side_m)
+                                    wrist_norm = _process_metric_depth(da3_wrist_m)
+                                else:
+                                    fused_side  = DA3DepthClient.fuse_with_realsense(da3_side_m,  rs_side[-1],  side_depth_scale)
+                                    fused_wrist = DA3DepthClient.fuse_with_realsense(da3_wrist_m, rs_wrist[-1], wrist_depth_scale)
+                                    side_norm  = _process_metric_depth(fused_side)
+                                    wrist_norm = _process_metric_depth(fused_wrist)
+                            else:
+                                # No DA3 result yet (first frame) — fall back to raw RealSense.
+                                side_norm  = _process_realsense_depth(rs_side[-1],  side_depth_scale)
+                                wrist_norm = _process_realsense_depth(rs_wrist[-1], wrist_depth_scale)
                         else:
                             side_norm  = _process_realsense_depth(rs_side[-1],  side_depth_scale)
                             wrist_norm = _process_realsense_depth(rs_wrist[-1], wrist_depth_scale)
@@ -511,6 +645,31 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         depth_panel = np.concatenate([side_overlay, wrist_overlay], axis=1)
                         if depth_video_writer is not None:
                             depth_video_writer.write(depth_panel)
+                        if depth_raw_video_writer is not None:
+                            side_vis_raw  = _depth_to_bgr(side_norm).copy()
+                            wrist_vis_raw = _depth_to_bgr(wrist_norm).copy()
+                            cv2.putText(side_vis_raw,  'SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            cv2.putText(wrist_vis_raw, 'WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            depth_raw_panel = np.concatenate([side_vis_raw, wrist_vis_raw], axis=1)
+                            depth_raw_video_writer.write(depth_raw_panel)
+                        if rs_debug_video_writer is not None:
+                            _wh = (DEPTH_IMG_W, DEPTH_IMG_H)
+                            rs_s_m = rs_side[-1].astype(np.float32) * side_depth_scale
+                            rs_w_m = rs_wrist[-1].astype(np.float32) * wrist_depth_scale
+                            rs_s_m[rs_side[-1] == 0] = DEPTH_CLIP[1]
+                            rs_w_m[rs_wrist[-1] == 0] = DEPTH_CLIP[1]
+                            rs_s_vis = _metric_to_bgr(rs_s_m, _wh)
+                            rs_w_vis = _metric_to_bgr(rs_w_m, _wh)
+                            cv2.putText(rs_s_vis, 'RS SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            cv2.putText(rs_w_vis, 'RS WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            rs_debug_video_writer.write(np.concatenate([rs_s_vis, rs_w_vis], axis=1))
+                        if da3_debug_video_writer is not None and use_da3_fusion and da3_side_m is not None:
+                            _wh = (DEPTH_IMG_W, DEPTH_IMG_H)
+                            da3_s_vis = _metric_to_bgr(da3_side_m,  _wh)
+                            da3_w_vis = _metric_to_bgr(da3_wrist_m, _wh)
+                            cv2.putText(da3_s_vis, 'DA3 SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            cv2.putText(da3_w_vis, 'DA3 WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            da3_debug_video_writer.write(np.concatenate([da3_s_vis, da3_w_vis], axis=1))
 
                         # ── Build proprio frame and append to history ──
                         arm_jp_now = obs['arm_joint_pos'][-1]
@@ -525,6 +684,11 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         side_t  = torch.from_numpy(side_norm).to(device)[None, None]   # (1,1,H,W)
                         wrist_t = torch.from_numpy(wrist_norm).to(device)[None, None]
 
+                        side_depth_mean += side_norm.mean()
+                        side_depth_std += side_norm.std()
+                        wrist_depth_mean += wrist_norm.mean()
+                        wrist_depth_std += wrist_norm.std()
+                        timestep += 1
                         # ── Run inference ──
                         with torch.no_grad():
                             action_mean = policy(proprio_tensor, [side_t, wrist_t]).cpu().numpy()
@@ -609,6 +773,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             save_sysid_data()
                             env.end_episode()
                             print('Stopped.')
+                            print(f"Side depth mean: {side_depth_mean / timestep}, std: {side_depth_std / timestep}")
+                            print(f"Wrist depth mean: {wrist_depth_mean / timestep}, std: {wrist_depth_std / timestep}")
                             break
                         elif key_stroke == ord('r'):
                             save_sysid_data()
@@ -632,6 +798,13 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             iter_idx = 0
                             term_area_start_timestamp = float('inf')
                             print('Robot reset complete! Starting new trajectory.')
+                            timestep = 0
+                            side_depth_mean = 0.0
+                            side_depth_std = 0.0
+                            wrist_depth_mean = 0.0
+                            wrist_depth_std = 0.0
+                            print(f"Side depth mean: {side_depth_mean / timestep}, std: {side_depth_std / timestep}")
+                            print(f"Wrist depth mean: {wrist_depth_mean / timestep}, std: {wrist_depth_std / timestep}")
                             continue
 
                         # auto termination
@@ -667,6 +840,14 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         print(f"  Continuous video saved.")
                     if depth_video_writer is not None:
                         depth_video_writer.release()
+                    if depth_raw_video_writer is not None:
+                        depth_raw_video_writer.release()
+                    if rs_debug_video_writer is not None:
+                        rs_debug_video_writer.release()
+                    if da3_debug_video_writer is not None:
+                        da3_debug_video_writer.release()
+                    if da3_bg is not None:
+                        da3_bg.stop()
                     break
 
                 print("Stopped.")
@@ -679,6 +860,12 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     print(f"  Continuous video saved.")
                 if depth_video_writer is not None:
                     depth_video_writer.release()
+                if depth_raw_video_writer is not None:
+                    depth_raw_video_writer.release()
+                if rs_debug_video_writer is not None:
+                    rs_debug_video_writer.release()
+                if da3_debug_video_writer is not None:
+                    da3_debug_video_writer.release()
 
 
 # %%
