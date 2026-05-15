@@ -142,3 +142,9 @@ dmypy.json
 
 # checkpoints
 *.pt
+
+# workflow stuff
+depth_testing/
+gripper/
+tactile/
+experiments/

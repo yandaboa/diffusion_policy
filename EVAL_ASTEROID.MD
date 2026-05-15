@@ -3,4 +3,4 @@ In your robodiff conda env (the one the diffusion_policy clone uses), make sure 
 python eval_real_robot.py \
     -i <asteroid_ckpt> \
     -o <save_dir> \
-    --robot_ip <ur5e_ip>
+    --robot_ip 192.168.1.10

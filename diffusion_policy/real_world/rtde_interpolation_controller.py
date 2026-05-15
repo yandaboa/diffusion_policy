@@ -323,6 +323,8 @@ class RTDEInterpolationController(mp.Process):
                                     self.joints_init_speed, 1.4)
 
             gripper.activate()
+            gripper_pos_open = float(gripper.get_open_position())
+            gripper_pos_closed = float(gripper.get_closed_position())
 
             # main loop
             curr_joints = rtde_r.getActualQ()
@@ -379,7 +381,8 @@ class RTDEInterpolationController(mp.Process):
                 state['robot_receive_timestamp'] = time.time()
                 if iter_idx % gripper_current_poll_interval == 0:
                     last_gripper_current = np.array([gripper.get_motor_current()], dtype=np.float64)
-                    last_gripper_pos = np.array([gripper.get_current_position()], dtype=np.float64)
+                    raw_pos = float(gripper.get_current_position())
+                    last_gripper_pos = np.array([(raw_pos - gripper_pos_open) / (gripper_pos_closed - gripper_pos_open)], dtype=np.float64)
                 state['gripper_current'] = last_gripper_current
                 state['gripper_pos'] = last_gripper_pos
                 state['osc_target_pos'] = current_target_ee_pos.copy()
