@@ -22,8 +22,18 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-PCTeacher-Lean-FullSysidDR-v0 \
   --num_envs 1 \
   --headless \
-  --checkpoint <abs-path-to-model_*.pt>
+  --checkpoint <abs-path-to-model_*.pt> \
+  agent.policy.teacher_jit_path=teachers/seed20_sysid_jit.pt
 ```
+
+> **Why `teacher_jit_path` is required even though we're only exporting the
+> student**: `StudentTeacherVision.__init__` calls `torch.jit.load(teacher_jit_path)`
+> unconditionally, so the runner can't be constructed without a valid teacher
+> JIT on disk. The JIT export itself (only deep-copies normalizer + encoder +
+> student) ignores the teacher entirely, so any loadable teacher works — pass
+> whichever you actually trained against. For the `FullSysidDR` env that's
+> typically one of `teachers/seed{20,21,22}_sysid_jit.pt`; for the non-sysid
+> Lean envs, `teachers/peg_prevact_seed{20,21}_jit.pt`.
 
 The exporter (`uwlab_rl/rsl_rl/exporter.py:export_vision_student_as_jit`) runs
 *before* the play loop. As soon as you see
@@ -105,6 +115,12 @@ no-return pixels mapped to d_max — same `process_image` math as the sim env's
 
 ## Common failures
 
+- **Export step crashes with `ValueError: The provided filename  does not exist`
+  inside `StudentTeacherVision.__init__` → `torch.jit.load(teacher_jit_path)`** —
+  `agent.policy.teacher_jit_path` defaults to `""` and the runner can't construct
+  without a valid teacher JIT on disk. Pass the teacher you trained against
+  (any loadable teacher works for export; the JIT export ignores it). See the
+  command in step 1.
 - **`proprio dim mismatch: built X but JIT expects Y`** — the eval script's
   proprio reconstruction disagrees with what the policy was trained on. Check
   `NUM_JOINTS`, `HISTORY_LEN`, and `GRIPPER_MIMIC_RATIOS` against the cfg.
