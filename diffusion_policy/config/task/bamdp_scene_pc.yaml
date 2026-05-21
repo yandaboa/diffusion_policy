@@ -1,0 +1,44 @@
+name: bamdp_scene_pc
+
+shape_meta: &shape_meta
+  obs:
+    # --- proprio terms (concatenated 25d in the env, but recorded as separate keys here) ---
+    prev_actions:
+      shape: [7]
+      type: low_dim
+    joint_pos:
+      shape: [12]
+      type: low_dim
+    end_effector_pose:
+      shape: [6]
+      type: low_dim
+    # --- scene pointcloud (flat 1536d = 512 points × 3) ---
+    scene_pc:
+      shape: [1536]
+      type: low_dim
+  action:
+    shape: [7]
+
+task_name: &task_name bamdp_scene_pc
+
+env_runner:
+  _target_: diffusion_policy.env_runner.dummy_runner.DummyRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.sim2real_image_dataset.Sim2RealImageMultiDataset
+  dataset_config:
+    - dataset_dir: ???
+      sampling_ratio: 1.0
+
+  use_streaming: false
+  samples_per_file_multiplier: 1.0
+  shape_meta: *shape_meta
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.05
+  use_cache: false
+  use_disk: true
