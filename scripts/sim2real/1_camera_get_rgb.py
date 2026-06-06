@@ -8,7 +8,7 @@ if __name__ == "__main__":
     multi_camera_wrapper = MultiCameraWrapper(rgb=True, depth=False, ir=False, high_res_rgb=False, align="rgb", type="realsense")
     
     # Get frames from first camera
-    camera = multi_camera_wrapper._all_cameras[0]
+    camera = multi_camera_wrapper._all_cameras[2]
     frames = camera.read_camera()
     rgb = frames["rgb"]
 

@@ -20,11 +20,16 @@ cat > "$_PY" <<'EOF'
 import pyrealsense2 as rs
 ctx = rs.context()
 for d in ctx.devices:
+    try:
+        usb = d.get_info(rs.camera_info.usb_type_descriptor)
+    except Exception:
+        usb = "?"
     print("|".join([
         d.get_info(rs.camera_info.serial_number),
         d.get_info(rs.camera_info.name),
         d.get_info(rs.camera_info.firmware_version),
         d.get_info(rs.camera_info.product_line),
+        usb,
     ]))
 EOF
 DEVICE_INFO=$(/home/yandabao/miniforge3/envs/robodiff_real/bin/python3 "$_PY" 2>/dev/null)
@@ -41,7 +46,16 @@ for entry in "${EXPECTED_CAMERAS[@]}"; do
         all_ok=0
     else
         fw=$(echo "$match" | cut -d'|' -f3)
-        echo -e "  ${GREEN}[OK]${NC}       $label  fw=$fw"
+        usb=$(echo "$match" | cut -d'|' -f5)
+        # usb_type_descriptor like "3.2" = SuperSpeed, "2.1"/"2.0" = USB 2 (bandwidth-limited)
+        if [[ "$usb" == 3* ]]; then
+            conn="${GREEN}USB ${usb}${NC}"
+        elif [[ "$usb" == 2* ]]; then
+            conn="${YELLOW}USB ${usb} (USB2 — bandwidth-limited)${NC}"
+        else
+            conn="${YELLOW}USB ?${NC}"
+        fi
+        echo -e "  ${GREEN}[OK]${NC}       $label  fw=$fw  conn=$conn"
     fi
 done
 

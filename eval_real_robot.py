@@ -19,6 +19,10 @@ Make sure you can hit the robot hardware emergency-stop button quickly!
 Recording control:
 Press "S" to stop evaluation and gain control back.
 Press "R" to reset robot to initial position and start new trajectory.
+
+The episode auto-terminates when the EE rises above --z_terminate (default 0.4 m).
+On any auto-termination you are prompted to label the episode: press "S" for
+success or "F" for fail. Labels are written to <save_dir>/eval_results.json.
 """
 
 # %%
@@ -142,7 +146,7 @@ def compute_calibrated_ee_pose(joint_positions):
                    "beginning.")
 @click.option('--steps_per_inference', '-si', default=1, type=int, 
               help="Action horizon for inference.")
-@click.option('--max_duration', '-md', default=1000, 
+@click.option('--max_duration', '-md', default=20,
               help='Max duration for each epoch in seconds.')
 @click.option('--frequency', '-f', default=10, type=float, 
               help="Control frequency in Hz.")
@@ -155,14 +159,34 @@ def compute_calibrated_ee_pose(joint_positions):
                    'Sim uses 25.0 on joint wrench; real F/T sensor differs.')
 @click.option('--collect_sysid', default=None, type=str,
               help='Save on-policy sysid data to .pt file (joint traj + OSC targets)')
+@click.option('--plot_gripper', is_flag=True, default=False,
+              help='Save a per-episode plot of the gripper_pos observation (and the '
+                   'commanded gripper) over time as a sanity check.')
+@click.option('--z_terminate', default=0.4, type=float,
+              help='Auto-terminate the episode when the EE z height (REP-103 base '
+                   'frame, m) exceeds this value. After termination the user is '
+                   "prompted to label the episode ('s'=success, 'f'=fail).")
+@click.option('--input_res', default='1280x720', type=str,
+              help='Camera capture resolution as WxH. Defaults to 1280x720, '
+                   'the highest resolution common to D415/D435/D455 at 30fps. '
+                   'Policy obs resolution is set by the checkpoint independently.')
 def main(input, output, robot_ip, match_dataset, match_episode,
-         vis_camera_idx, init_joints, 
+         vis_camera_idx, init_joints,
          steps_per_inference, max_duration,
          frequency, save_video, action_noise, contact_threshold,
-         collect_sysid):
-    # Per-axis Cartesian scale matching simulation DiffIK config
-    CARTESIAN_SCALE = np.array([0.01, 0.01, 0.002, 0.02, 0.02, 0.2])
-    print(f"Cartesian OSC scale: {CARTESIAN_SCALE}")
+         collect_sysid, plot_gripper, z_terminate, input_res):
+    # Parse camera capture resolution
+    capture_w, capture_h = (int(x) for x in input_res.lower().split('x'))
+    capture_resolution = (capture_w, capture_h)
+    print(f"Camera capture resolution: {capture_resolution}")
+
+    # Per-axis Cartesian scale matching the sim action config (raw policy output -> meters/rad).
+    #   - Legacy 6-DOF action [x,y,z,rx,ry,rz]: full pose delta.
+    #   - Position-only action [x,y,z]: xyz delta only; orientation is left uncommanded
+    #     (RelCartesianOSCPositionAction, scale_xyz_axisangle=(0.02, 0.02, 0.02, ...)).
+    # The active scale is selected below once the checkpoint's action dim is known.
+    CARTESIAN_SCALE_6DOF = np.array([0.01, 0.01, 0.002, 0.02, 0.02, 0.2])
+    CARTESIAN_SCALE_POSONLY = np.array([0.01, 0.01, 0.002])
 
     # Sysid data collection state
     sysid_records = []  # list of (joint_pos, target_pos, target_quat)
@@ -186,6 +210,82 @@ def main(input, output, robot_ip, match_dataset, match_episode,
         }, collect_sysid)
         print(f"\nSaved sysid data ({n} policy steps at {frequency}Hz) to: {collect_sysid}")
 
+    # Gripper-pos sanity-check plotting state.
+    # Each record is (t_rel_s, gripper_pos_obs, commanded_gripper) for the current episode.
+    gripper_pos_records = []
+    _gripper_plot_count = [0]  # mutable so the closure can advance the per-episode file index
+
+    def save_gripper_plot():
+        """Save the current episode's gripper_pos observation (and commanded gripper) vs time."""
+        if not plot_gripper or len(gripper_pos_records) == 0:
+            return
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        arr = np.array(gripper_pos_records, dtype=np.float32)
+        idx = _gripper_plot_count[0]
+        _gripper_plot_count[0] += 1
+        plot_path = pathlib.Path(output) / f'gripper_pos_ep_{idx:03d}.png'
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(arr[:, 0], arr[:, 1], color='C0', label='gripper_pos (obs)')
+        ax.plot(arr[:, 0], arr[:, 2], color='C1', alpha=0.6,
+                drawstyle='steps-post', label='commanded (>0=open)')
+        ax.set_xlabel('time (s)')
+        ax.set_ylabel('gripper')
+        ax.set_title(f'Gripper pos observation — episode {idx}')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best')
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=120)
+        plt.close(fig)
+        print(f"\nSaved gripper plot ({len(arr)} steps) to: {plot_path}")
+
+    # Episode success/fail labels collected after auto-termination.
+    episode_results = []  # list of dicts: {'episode', 'result', 'z', 't'}
+
+    def prompt_success_fail(episode_id, ee_z):
+        """Block (via the OpenCV window) until the user labels the episode.
+
+        Press 's' = SUCCESS, 'f' = FAIL. Returns the bool result and appends a
+        record to ``episode_results``, persisted to ``output/eval_results.json``.
+        """
+        print(f"Episode {episode_id} terminated (EE z={ee_z:.3f}). "
+              "Label it: 's'=SUCCESS, 'f'=FAIL ...")
+        result = None
+        while result is None:
+            canvas = np.zeros((200, 700, 3), dtype=np.uint8)
+            cv2.putText(canvas, f"EPISODE {episode_id} TERMINATED (z={ee_z:.3f})",
+                        (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(canvas, "'s' = SUCCESS", (15, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(canvas, "'f' = FAIL", (15, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.imshow('Policy Control', canvas)
+            key = cv2.waitKey(50) & 0xFF
+            if key == ord('s'):
+                result = True
+            elif key == ord('f'):
+                result = False
+        print(f"  -> {'SUCCESS' if result else 'FAIL'}")
+        episode_results.append({
+            'episode': int(episode_id),
+            'result': 'success' if result else 'fail',
+            'z': float(ee_z),
+            't': time.time(),
+        })
+        n_succ = sum(r['result'] == 'success' for r in episode_results)
+        n_tot = len(episode_results)
+        results_path = pathlib.Path(output) / 'eval_results.json'
+        with open(results_path, 'w') as f:
+            json.dump({
+                'n_episodes': n_tot,
+                'n_success': n_succ,
+                'success_rate': n_succ / n_tot,
+                'episodes': episode_results,
+            }, f, indent=2)
+        print(f"  [{n_succ}/{n_tot} success] saved to {results_path}")
+        return result
+
     # load match_dataset
     match_camera_idx = 0
     episode_first_frame_map = dict()
@@ -203,14 +303,28 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     
     # load checkpoint
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
-    configs = [
-        json.load(open("diffusion_policy/real_world/realsense_config/"
-                      "455_front.json")),
-        json.load(open("diffusion_policy/real_world/realsense_config/"
-                      "435_side.json")),
-        json.load(open("diffusion_policy/real_world/realsense_config/"
-                      "415_wrist.json"))
+
+    # Detect which cameras are physically connected and filter accordingly.
+    # RealEnv maps camera index 0→front_rgb, 1→side_rgb, 2→wrist_rgb, so
+    # dropping a serial from the list simply omits that key from obs.
+    import pyrealsense2 as _rs
+    _connected = {
+        d.get_info(_rs.camera_info.serial_number)
+        for d in _rs.context().devices
+        if d.get_info(_rs.camera_info.name).lower() != 'platform camera'
+    }
+    _all_cameras = [
+        # ('215122255213', json.load(open("diffusion_policy/real_world/realsense_config/455_front.json"))),
+        ('832112070487', json.load(open("diffusion_policy/real_world/realsense_config/435_side.json"))),
+        # ('746112060198', json.load(open("diffusion_policy/real_world/realsense_config/415_wrist.json"))),
     ]
+    _active = [(s, c) for s, c in _all_cameras if s in _connected]
+    _missing = [s for s, _ in _all_cameras if s not in _connected]
+    if _missing:
+        print(f"Warning: cameras not connected, skipping: {_missing}")
+    camera_serial_numbers = [s for s, _ in _active]
+    configs = [c for _, c in _active]
+    print(f"Active cameras: {camera_serial_numbers}")
 
     ckpt_path = input
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
@@ -254,10 +368,24 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     print("steps_per_inference: ", steps_per_inference)
     print("n_action_steps: ", n_action_steps)
 
+    # Action-space layout from the checkpoint. The last dim is the binary gripper;
+    # the remaining arm dims are either 6 (full Cartesian pose delta) or 3 (position-only).
+    action_dim = int(cfg['shape_meta']['action']['shape'][0])
+    arm_action_dim = action_dim - 1
+    if arm_action_dim not in (3, 6):
+        raise ValueError(
+            f"Unsupported action_dim={action_dim}; expected 4 (3 arm + gripper) "
+            f"or 7 (6 arm + gripper).")
+    position_only = (arm_action_dim == 3)
+    CARTESIAN_SCALE = CARTESIAN_SCALE_POSONLY if position_only else CARTESIAN_SCALE_6DOF
+    print(f"action_dim: {action_dim} ({arm_action_dim} arm + 1 gripper), "
+          f"position_only={position_only}")
+    print(f"Cartesian OSC scale: {CARTESIAN_SCALE}")
+
     with SharedMemoryManager() as shm_manager:
         with Spacemouse(shm_manager=shm_manager) as sm, RealEnv(
-            output_dir=output, 
-            robot_ip=robot_ip, 
+            output_dir=output,
+            robot_ip=robot_ip,
             frequency=frequency,
             n_obs_steps=n_obs_steps,
             obs_image_resolution=obs_res,
@@ -267,9 +395,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             record_raw_video=True,
             rolling_action_buffer=True,
             action_mode='cartesian',
-            camera_serial_numbers=['215122255213', '832112070487',
-                                  '746112060198'],
+            arm_action_dim=arm_action_dim,
+            camera_serial_numbers=camera_serial_numbers,
             camera_configs=configs,
+            video_capture_resolution=capture_resolution,
             # number of threads per camera view for video recording (H.264)
             thread_per_video=3,
             # video recording quality, lower is better (but slower).
@@ -334,9 +463,20 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             while True:
                 # ========== policy control loop ==============
                 try:
+                    # Reset robot to its initial position between episodes so every
+                    # episode starts from the same home pose (also covers the 's'-stop
+                    # path, which otherwise restarts wherever the previous run ended).
+                    print('Resetting robot to initial position...')
+                    env.robot.reset_to_initial_position()
+                    time.sleep(5.0)
+                    print('Reset complete.')
+
                     # start episode
                     policy.reset()
                     obs_history.clear()
+                    gripper_open_steps_remaining = 0
+                    sysid_records.clear()
+                    gripper_pos_records.clear()
                     start_delay = 1.0
                     eval_t_start = time.time() + start_delay
                     t_start = time.monotonic() + start_delay
@@ -367,7 +507,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
                         # Capture frames for video if enabled (streamed to disk in real-time)
                         if save_video:
-                            camera_names = ['front_rgb', 'side_rgb', 'wrist_rgb']
+                            # camera_names = ['front_rgb', 'side_rgb', 'wrist_rgb']
+                            camera_names = ['front_rgb', 'side_rgb']
                             imgs = []
                             for cam_name in camera_names:
                                 if cam_name in obs:
@@ -393,11 +534,12 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             result = policy.predict_action(obs_dict)
                             action = result['action'][0:1].detach().to('cpu').numpy()
                         
-                        # action shape: (N, 7) where [:, :6] is Cartesian delta, [:, 6] is gripper
-                        raw_arm_action = action[:, :6]  # Raw network output (pre-scale)
+                        # action shape: (N, action_dim) where [:, :arm_action_dim] is the
+                        # Cartesian delta (xyz[+rpy]) and the last dim is the binary gripper.
+                        raw_arm_action = action[:, :arm_action_dim]  # Raw network output (pre-scale)
                         if action_noise > 0:
                             raw_arm_action = raw_arm_action + np.random.randn(*raw_arm_action.shape) * action_noise
-                        gripper_actions = action[:, 6:7]
+                        gripper_actions = action[:, arm_action_dim:arm_action_dim+1]
 
                         # Stuck detection: if robot barely moved for STUCK_WINDOW_S, open gripper to get unstuck
                         if gripper_open_steps_remaining == 0:
@@ -421,13 +563,28 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             if gripper_open_steps_remaining == 0:
                                 print("[Gripper macro] done, returning to policy control")
 
+                        # Sanity-check log: gripper_pos observation vs commanded gripper.
+                        if plot_gripper and 'gripper_pos' in obs:
+                            gripper_pos_records.append((
+                                time.monotonic() - t_start,
+                                float(np.asarray(obs['gripper_pos'][-1]).reshape(-1)[0]),
+                                float(gripper_actions[0, 0]),
+                            ))
+
                         raw_actions = np.concatenate([raw_arm_action, gripper_actions], axis=1)  # for last_arm_action obs
 
                         # Cartesian OSC: scale delta, compute absolute target from observed pose
                         scaled_delta = raw_arm_action * CARTESIAN_SCALE
                         obs_jp = obs['arm_joint_pos'][-1]
                         obs_pos, obs_quat = get_ee_pose(obs_jp)
-                        tgt_pos, tgt_quat = apply_delta_pose(obs_pos, obs_quat, scaled_delta[0])
+                        if position_only:
+                            # Policy commands xyz only; orientation is left uncommanded so the
+                            # target orientation tracks the current EE orientation (no rotation
+                            # error accumulates -- mirrors RelCartesianOSCPositionAction in sim).
+                            tgt_pos = obs_pos + scaled_delta[0]
+                            tgt_quat = obs_quat
+                        else:
+                            tgt_pos, tgt_quat = apply_delta_pose(obs_pos, obs_quat, scaled_delta[0])
                         tgt_aa = quat_to_axis_angle(tgt_quat)
                         abs_target = np.concatenate([tgt_pos, tgt_aa])[None]  # (1, 6)
                         target_actions = np.concatenate([abs_target, gripper_actions], axis=1)
@@ -490,13 +647,16 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             # Stop episode
                             # Hand control back to human
                             save_sysid_data()
+                            save_gripper_plot()
                             env.end_episode()
                             print('Stopped.')
                             break
                         elif key_stroke == ord('r'):
                             # Reset robot and start new trajectory
                             save_sysid_data()
+                            save_gripper_plot()
                             sysid_records.clear()
+                            gripper_pos_records.clear()
                             stuck_buffer.clear()
                             print('Resetting robot for new trajectory...')
                             env.end_episode()
@@ -533,7 +693,11 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
                         # auto termination
                         terminate = False
-                        if time.monotonic() - t_start > max_duration:
+                        ee_z = float(obs_pos[2])  # EE height (REP-103 base frame)
+                        if ee_z > z_terminate:
+                            terminate = True
+                            print(f'Terminated: EE z={ee_z:.3f} > {z_terminate:.3f}')
+                        elif time.monotonic() - t_start > max_duration:
                             terminate = True
                             print('Terminated by the timeout!')
 
@@ -556,11 +720,16 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
                         if terminate:
                             save_sysid_data()
+                            save_gripper_plot()
                             env.end_episode()
                             if save_video and episode_video_writer is not None:
                                 episode_video_writer.close()
                                 episode_video_writer = None
                                 print(f"  Episode video saved.")
+                            # Interactively label the episode before homing for the next run.
+                            prompt_success_fail(episode_id, ee_z)
+                            # Robot is homed by the reset at the top of the next episode.
+                            print('Episode terminated; restarting.')
                             break
 
                         # wait for execution
@@ -571,6 +740,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     print(e)
                     print("Interrupted!")
                     save_sysid_data()
+                    save_gripper_plot()
                     env.end_episode()
                     if save_video and episode_video_writer is not None:
                         episode_video_writer.close()

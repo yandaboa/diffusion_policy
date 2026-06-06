@@ -50,6 +50,10 @@ class RealEnv:
             # action
             rolling_action_buffer=False,
             action_mode='joint',  # 'joint' or 'cartesian' (direct Cartesian OSC)
+            # width of the *arm* part of the policy action (excludes the 1 gripper dim).
+            # 6 = full 6-DOF Cartesian delta [x,y,z,rx,ry,rz]; 3 = position-only [x,y,z].
+            # Drives the shape of last_arm_action obs and the obs_actions buffer.
+            arm_action_dim=6,
             # robot
             init_joints=True,
             custom_init_joints=None,  # Custom initial joint positions
@@ -168,7 +172,7 @@ class RealEnv:
 
         cube_diag = np.linalg.norm([1,1,1])
 
-        custom_init_joints = np.array([0.052069, -1.332192, 2.005394, -2.242712, -1.568915, -0.048283])
+        custom_init_joints = np.array([0.013, -1.379, 2.181, -2.363, -1.573, -0.087])
         
         # Handle joint initialization
         j_init = None
@@ -209,6 +213,7 @@ class RealEnv:
         self.max_obs_buffer_size = max_obs_buffer_size
         self.obs_key_map = obs_key_map
         self.action_mode = action_mode
+        self.arm_action_dim = arm_action_dim
         # recording
         self.output_dir = output_dir
         self.video_dir = video_dir
@@ -298,13 +303,14 @@ class RealEnv:
                 if len(is_before_idxs) > 0:
                     this_idx = is_before_idxs[-1]
                 this_idxs.append(this_idx)
-            # remap key
-            if camera_idx == 0:
-                camera_obs[f'front_rgb'] = value['color'][this_idxs]
-            elif camera_idx == 1:
-                camera_obs[f'side_rgb'] = value['color'][this_idxs]
+            # remap key: 3-camera setup has front/side/wrist; 2-camera skips front
+            n_cams = self.realsense.n_cameras
+            if n_cams >= 3:
+                cam_names = ['front_rgb', 'side_rgb', 'wrist_rgb']
             else:
-                camera_obs[f'wrist_rgb'] = value['color'][this_idxs]
+                cam_names = ['side_rgb', 'wrist_rgb']
+            if camera_idx < len(cam_names):
+                camera_obs[cam_names[camera_idx]] = value['color'][this_idxs]
         
         # align robot obs
         robot_timestamps = last_robot_data['robot_receive_timestamp']
@@ -334,24 +340,26 @@ class RealEnv:
             )
 
         # last_arm_action / last_gripper_action: from action buffer (pre-scale when exec_actions called with obs_actions)
+        # Buffer rows are [arm_action_dim arm dims, 1 gripper dim]; width adapts to the policy.
+        arm_dim = self.arm_action_dim
+        act_dim = arm_dim + 1
         last_actions = dict()
         if self.action_buffer is not None and len(self.action_buffer) > 0:
-            last_actions_raw = np.zeros((self.n_obs_steps, 7), dtype=np.float32)
+            last_actions_raw = np.zeros((self.n_obs_steps, act_dim), dtype=np.float32)
             actions = np.array(self.action_buffer)
 
             # overlay the buffer in
             last_actions_raw[:actions.shape[0], :] = actions
 
             last_actions = {
-                'last_arm_action': last_actions_raw[:,:6],
-                'last_gripper_action': last_actions_raw[:,6:7] 
+                'last_arm_action': last_actions_raw[:, :arm_dim],
+                'last_gripper_action': last_actions_raw[:, arm_dim:act_dim]
             }
         else:
             # values = self.robot.get_state()['ActualQ']
-            values = np.zeros(7)
-            obs_array = np.tile(values, (self.n_obs_steps, 1))
+            obs_array = np.zeros((self.n_obs_steps, act_dim), dtype=np.float32)
             last_actions = {
-                'last_arm_action': obs_array[:,:6],
+                'last_arm_action': obs_array[:, :arm_dim],
                 'last_gripper_action': np.zeros((self.n_obs_steps, 1))
             }
         
@@ -382,7 +390,8 @@ class RealEnv:
                 - actions[:, 6] = Gripper position (<0=closed, >=0=open)
             timestamps: Action timestamps
             stages: Optional stage information
-            obs_actions: Optional (shape: N x 7). If set, stored in action buffer and
+            obs_actions: Optional (shape: N x (arm_action_dim + 1), i.e. the raw policy
+                action: arm dims + 1 gripper). If set, stored in action buffer and
                 accumulators so last_arm_action in obs is pre-scale; actions are still executed.
         """
         assert self.is_ready
@@ -433,8 +442,11 @@ class RealEnv:
         to_store = new_actions
         if obs_actions is not None:
             obs_actions = np.array(obs_actions)
-            if obs_actions.shape[-1] != 7:
-                raise ValueError(f"obs_actions must have 7 dimensions, got shape {obs_actions.shape}")
+            expected_obs_dim = self.arm_action_dim + 1
+            if obs_actions.shape[-1] != expected_obs_dim:
+                raise ValueError(
+                    f"obs_actions must have {expected_obs_dim} dimensions "
+                    f"({self.arm_action_dim} arm + 1 gripper), got shape {obs_actions.shape}")
             if obs_actions.shape[0] == actions.shape[0]:
                 to_store = obs_actions[is_new]
             else:

@@ -150,3 +150,8 @@ tactile/
 experiments/
 tmp/
 tactile_asteroid_0/
+tactile_eval**/
+*.json
+*.png
+*.ckpt
+*.npy

@@ -23,7 +23,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
   --num_envs 1 \
   --headless \
   --checkpoint <abs-path-to-model_*.pt> \
-  agent.policy.teacher_jit_path=teachers/seed20_sysid_jit.pt
+  agent.policy.teacher_jit_path=teachers/seed20_sysid_jit.pt --enable_cameras
 ```
 
 > **Why `teacher_jit_path` is required even though we're only exporting the
@@ -68,7 +68,7 @@ cd /mnt/storage/lti/diffusion_policy
 python eval_real_robot_depth.py \
   -i <ckpt-dir>/exported/depth_policy.pt \
   -o tmp/depth_eval_$(date +%s) \
-  --robot_ip <ur5e-ip> \
+  --robot_ip 192.168.1.10 \
   --save_video
 ```
 
@@ -144,3 +144,13 @@ no-return pixels mapped to d_max — same `process_image` math as the sim env's
 | `diffusion_policy/eval_real_robot.py` | Untouched — ASTEROID / diffusion_policy ckpts |
 | `diffusion_policy/diffusion_policy/real_world/da3_depth_client.py` | DA3METRIC subprocess + RealSense fusion (reused) |
 | `diffusion_policy/demo_real_robot.py` | Reference for depth viz + DA3 fusion patterns |
+
+
+# Eval RGB
+```
+python eval_real_robot_rgb.py \
+  -i <ckpt-dir>/exported/rgb_policy.pt \
+  -o tmp/rgb_eval_$(date +%s) \
+  --robot_ip 192.168.1.10 \
+  --save_video
+```

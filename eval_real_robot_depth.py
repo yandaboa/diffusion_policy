@@ -25,6 +25,12 @@ gripper open for a few steps (also auto-triggered after 2 s of no motion).
 
 # %%
 import time
+import sys
+import select
+import termios
+import tty
+import queue
+import threading
 from collections import deque
 from multiprocessing.managers import SharedMemoryManager
 import click
@@ -68,9 +74,12 @@ NUM_ARM_JOINTS = 6
 NUM_GRIPPER_JOINTS = 6
 NUM_JOINTS = NUM_ARM_JOINTS + NUM_GRIPPER_JOINTS  # 12
 
-# Robotiq 2F85 master joint angle: gripper_pos register (0-255) → radians.
-# Same mapping as demo_real_robot.py's _GRIPPER_JOINT_SCALE.
-GRIPPER_POS_TO_RAD = np.pi / 4 / 255.0
+# RTDEInterpolationController normalizes gripper_pos to [0, 1] using the
+# hardware-calibrated open/close positions from gripper.get_open/closed_position().
+# 0.0 = fully open (master_angle = 0 rad), 1.0 = fully closed (master_angle = π/4 rad).
+GRIPPER_POS_OPEN  = 0.0   # calibrated open  (normalized by controller)
+GRIPPER_POS_CLOSE = 1.0   # calibrated close (normalized by controller)
+GRIPPER_POS_TO_RAD = np.pi / 4 / (GRIPPER_POS_CLOSE - GRIPPER_POS_OPEN)
 
 # Mimic-ratio pattern for the 6 gripper joints w.r.t. the finger_joint master,
 # in the articulation order Isaac Lab returns ``robot.data.joint_pos``.
@@ -89,6 +98,64 @@ GRIPPER_MIMIC_RATIOS = np.array([
     -1.0,  # col 10
     -1.0,  # col 11
 ], dtype=np.float32)
+
+
+class _KeyReader:
+    """Non-blocking keyboard reader via terminal cbreak mode.
+
+    Reads keys directly from stdin rather than relying on cv2/Qt events,
+    which break under the multithreaded SharedMemoryManager environment.
+
+    Usage:
+        reader = _KeyReader()
+        reader.start()
+        ...
+        key = reader.get()   # returns ord(char) or -1 if nothing pending
+        ...
+        reader.stop()
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._fd: int = sys.stdin.fileno()
+        self._old_settings = None
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> '_KeyReader':
+        self._old_settings = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)   # char-by-char input; keeps Ctrl+C working
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name='_KeyReader')
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch = sys.stdin.read(1)
+                    self._q.put(ord(ch))
+            except Exception:
+                break
+
+    def get(self) -> int:
+        """Return the next pending keycode (int) or -1 if nothing pressed."""
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            return -1
 
 
 def _process_realsense_depth(depth_u16: np.ndarray, depth_scale: float) -> np.ndarray:
@@ -184,12 +251,13 @@ def _build_joint_pos(arm_joint_pos: np.ndarray, gripper_pos_raw: float) -> np.nd
 
     Args:
         arm_joint_pos: (6,) UR5e joint angles (rad).
-        gripper_pos_raw: scalar Robotiq POS register (0=open, 255=closed).
+        gripper_pos_raw: normalized gripper position in [0, 1] (0=open, 1=closed),
+            as returned by RTDEInterpolationController using calibrated open/close positions.
     Returns: (12,) float32 in the order Isaac Lab returns
         ``asset.data.joint_pos`` for EXPLICIT_UR5E_ROBOTIQ_2F85
         (arm joints first, then 6 gripper joints driven by mimic).
     """
-    master_angle = float(gripper_pos_raw) * GRIPPER_POS_TO_RAD
+    master_angle = (float(gripper_pos_raw) - GRIPPER_POS_OPEN) * GRIPPER_POS_TO_RAD
     gripper_joints = (GRIPPER_MIMIC_RATIOS * master_angle).astype(np.float32)
     return np.concatenate([arm_joint_pos.astype(np.float32), gripper_joints], axis=0)
 
@@ -528,6 +596,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 print(f"Camera video recording enabled at {video_fps} fps")
                 print(f"  Continuous video: {long_video_path}")
 
+            # Terminal key reader — works regardless of cv2/Qt threading issues.
+            key_reader = _KeyReader().start()
+            print("Key reader active: [S] stop  [R] reset  [G] open gripper")
+
             actions = []
             gripper_open_steps_remaining = 0
             GRIPPER_OPEN_DURATION = 5
@@ -764,8 +836,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             cv2.imshow('Policy Control', vis_img[..., ::-1])
                         if save_video:
                             cv2.imshow('Depth (policy input)', depth_panel)
+                        cv2.waitKey(1)  # refresh display only — key detection is via key_reader
 
-                        key_stroke = cv2.pollKey()
+                        key_stroke = key_reader.get()
                         if key_stroke == ord('g'):
                             gripper_open_steps_remaining = GRIPPER_OPEN_DURATION
                             print(f"[Gripper macro] opening gripper for {GRIPPER_OPEN_DURATION} steps")
@@ -830,6 +903,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     print("Interrupted!")
                     save_sysid_data()
                     env.end_episode()
+                    key_reader.stop()
                     if save_video and episode_video_writer is not None:
                         episode_video_writer.close()
                         episode_video_writer = None
@@ -851,6 +925,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     break
 
                 print("Stopped.")
+                key_reader.stop()
                 if save_video and episode_video_writer is not None:
                     episode_video_writer.close()
                     episode_video_writer = None

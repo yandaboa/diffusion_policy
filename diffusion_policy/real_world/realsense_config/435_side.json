@@ -98,7 +98,7 @@
     "viewer": {
         "stream-depth-format": "Z16",
         "stream-fps": "30",
-        "stream-height": "480",
-        "stream-width": "848"
+        "stream-height": "240",
+        "stream-width": "320"
     }
 }
