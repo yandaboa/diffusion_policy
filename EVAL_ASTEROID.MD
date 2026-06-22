@@ -2,5 +2,5 @@ In your robodiff conda env (the one the diffusion_policy clone uses), make sure 
 
 python eval_real_robot.py \
     -i <asteroid_ckpt> \
-    -o <save_dir> \
+    -o tmp/rgb_eval_$(date +%s) \
     --robot_ip 192.168.1.10

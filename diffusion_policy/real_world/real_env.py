@@ -172,7 +172,7 @@ class RealEnv:
 
         cube_diag = np.linalg.norm([1,1,1])
 
-        custom_init_joints = np.array([0.013, -1.379, 2.181, -2.363, -1.573, -0.087])
+        custom_init_joints = np.array([0.020015, -1.39426, 2.13054, -2.246, -1.618852138519287, -0.087])
         
         # Handle joint initialization
         j_init = None

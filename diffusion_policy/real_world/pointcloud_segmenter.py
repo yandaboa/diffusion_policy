@@ -3,8 +3,10 @@
 Mirrors the SAM2 usage in ``orbbec/orbbec_segment_pointclouds.py`` (image predictor,
 point-click prompts), generalized to the 3 deployment classes. Produces a (H, W) label
 map with values in SEG_LABELS = {robot:0.0, peg:-1.0, hole:+1.0} and NaN for background,
-aligned with the image you pass in (run it on the SAME frame the depth is in -- i.e. the
-left-IR image when depth comes from FFS, or the color image when depth is RealSense-aligned).
+aligned with the image you pass in. The label map must ultimately align with the DEPTH frame:
+either segment the frame depth is already in (color image when depth is RealSense-aligned), or
+segment the color image and reverse-warp the masks with ``warp_masks_to_depth_frame`` (the FFS
+path -- SAM2 is far better on RGB than on raw IR, so we segment color, not the left-IR frame).
 
 The SAM2 dependency is isolated in ``PointCloudSegmenter``; the mask->label composition
 (``compose_label_map``) is pure-numpy and unit-tested without SAM2.
@@ -77,6 +79,15 @@ class PointCloudSegmenter:
                 point_coords=points, point_labels=labels, multimask_output=True)
         return masks[int(np.argmax(scores))].astype(bool)
 
+    def masks(self, rgb: np.ndarray, prompts: dict) -> dict:
+        """Per-class bool masks for ``prompts`` (no compose/erode). See ``label_map``."""
+        out = {}
+        for name, (pos, neg) in prompts.items():
+            if not pos:
+                continue
+            out[name] = self.mask(rgb, pos, list(neg))
+        return out
+
     def label_map(self, rgb: np.ndarray, prompts: dict, erode: int = 3) -> np.ndarray:
         """Segment each class and compose the (H, W) seg-label map.
 
@@ -85,12 +96,57 @@ class PointCloudSegmenter:
                 scene. Each *_clicks is a list of [x, y]. Omit a class to leave it absent.
         """
         h, w = rgb.shape[:2]
-        masks = {}
-        for name, (pos, neg) in prompts.items():
-            if not pos:
-                continue
-            masks[name] = self.mask(rgb, pos, list(neg))
-        return compose_label_map(masks, (h, w), erode=erode)
+        return compose_label_map(self.masks(rgb, prompts), (h, w), erode=erode)
+
+
+def warp_masks_to_depth_frame(masks: dict, depth: np.ndarray, K_depth: np.ndarray,
+                              K_color: np.ndarray, T_depth_color: np.ndarray) -> dict:
+    """Reverse-warp color-frame bool masks into the depth camera's pixel grid.
+
+    When depth comes from FFS (left-IR frame) but SAM2 was run on the COLOR image, the masks
+    live in the color frame and must be carried into the IR/depth frame before composing the
+    label map (which must align pixel-for-pixel with ``depth``). For every depth pixel with
+    valid depth we backproject to 3D in the depth frame, transform into the color frame, project
+    into the color image, and sample the color mask there (nearest-neighbour).
+
+    Args:
+        masks: {class_name -> (Hc, Wc) bool} in the COLOR frame.
+        depth: (H, W) metric depth in the depth/IR frame (0 or non-finite = invalid).
+        K_depth, K_color: (3, 3) intrinsics of the depth and color cameras.
+        T_depth_color: (4, 4) depth-frame -> color-frame rigid transform.
+
+    Returns:
+        {class_name -> (H, W) bool} on the depth grid (False wherever depth is invalid or the
+        reprojection lands outside the color image / behind the color camera).
+    """
+    h, w = depth.shape
+    vv, uu = np.indices((h, w))
+    z = np.asarray(depth, np.float64)
+    valid = np.isfinite(z) & (z > 0)
+
+    # backproject depth pixels -> 3D points in the depth frame
+    x = (uu - K_depth[0, 2]) / K_depth[0, 0] * z
+    y = (vv - K_depth[1, 2]) / K_depth[1, 1] * z
+    pts = np.stack([x, y, z], axis=-1)  # (H, W, 3)
+
+    # depth frame -> color frame, then project into the color image
+    R, t = T_depth_color[:3, :3], T_depth_color[:3, 3]
+    pc = pts @ R.T + t
+    zc = pc[..., 2]
+    safe = valid & (zc > 0)
+    zc_safe = np.where(safe, zc, 1.0)
+    uc = np.round(pc[..., 0] / zc_safe * K_color[0, 0] + K_color[0, 2]).astype(np.int64)
+    vc = np.round(pc[..., 1] / zc_safe * K_color[1, 1] + K_color[1, 2]).astype(np.int64)
+
+    out = {}
+    for name, m in masks.items():
+        m = np.asarray(m, bool)
+        hc, wc = m.shape
+        in_b = safe & (uc >= 0) & (uc < wc) & (vc >= 0) & (vc < hc)
+        warped = np.zeros((h, w), bool)
+        warped[in_b] = m[vc[in_b], uc[in_b]]
+        out[name] = warped
+    return out
 
 
 def pick_prompts_interactive(rgb: np.ndarray, class_names=("robot", "peg", "hole")) -> dict:

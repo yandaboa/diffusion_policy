@@ -7,7 +7,8 @@ motion, NO policy stepping -- purely to validate frame / scale / labels.
 
 Depth sources (--depth-source)
   realsense  hardware depth (aligned to color); SAM2 runs on color.
-  ffs        Fast-FoundationStereo on the IR stereo pair (left-IR frame); SAM2 on left-IR.
+  ffs        Fast-FoundationStereo on the IR stereo pair (left-IR frame); SAM2 runs on the
+             color image, masks reverse-warped into the left-IR/depth frame (SAM2 >> on RGB).
   file       depth/K/extrinsic/joints (+ optional label_map) from --from-file.
   (--demo uses a synthetic scene; no hardware, no SAM2.)
 
@@ -83,25 +84,42 @@ def _capture_realsense(serial, resolution):
 
 
 def _capture_ffs(serial, resolution, mock):
-    """Stereo IR -> FoundationStereo metric depth (left-IR frame). seg image = left IR (RGB)."""
+    """Stereo IR -> FoundationStereo metric depth (left-IR frame).
+
+    SAM2 runs far better on the COLOR image than on raw IR, so the seg image is the color
+    frame and we return a ``warp`` dict (K_ir/K_color/T_ir_color) so the color-frame masks can
+    be reverse-warped into the IR/depth frame. Returns (seg_img, depth, K_ir, units/m, warp).
+    """
     from diffusion_policy.real_world.realsense_stereo import capture_stereo
     from diffusion_policy.real_world.ffs_depth_client import FFSDepthClient
-    f = capture_stereo(serial, resolution=tuple(resolution), want_color=False)
+    f = capture_stereo(serial, resolution=tuple(resolution), want_color=True)
     with FFSDepthClient(mock=mock) as ffs:
         depth = ffs.infer(f.left, f.right, f.K_ir, f.baseline_m)  # metres
-    seg_img = np.repeat(f.left[..., None], 3, axis=2)  # IR->3ch for SAM2
-    return seg_img, depth, f.K_ir, 1.0  # depth already metric -> units-per-metre = 1
+    warp = {"K_ir": f.K_ir, "K_color": f.K_color, "T_ir_color": f.T_ir_color}
+    return f.color, depth, f.K_ir, 1.0, warp  # depth already metric -> units-per-metre = 1
 
 
-def _segment(seg_img, sam2_ckpt, sam2_cfg, erode):
+def _segment(seg_img, sam2_ckpt, sam2_cfg, erode, depth=None, warp=None):
+    """Prompt SAM2 on ``seg_img`` -> (H, W) label map aligned to ``depth``.
+
+    If ``warp`` is given (FFS path: seg_img is color, depth is in the IR frame), the color-frame
+    masks are reverse-warped into the IR/depth frame before composing. Otherwise seg_img already
+    shares the depth frame (RealSense color-aligned) and masks compose directly.
+    """
     from diffusion_policy.real_world.pointcloud_segmenter import (
-        PointCloudSegmenter, pick_prompts_interactive)
+        PointCloudSegmenter, compose_label_map, pick_prompts_interactive,
+        warp_masks_to_depth_frame)
     prompts = pick_prompts_interactive(seg_img)
     if not prompts:
         click.echo("  [seg] no prompts given -> geometry-only")
         return None
     seg = PointCloudSegmenter(sam2_ckpt, sam2_cfg)
-    return seg.label_map(seg_img, prompts, erode=erode)
+    if warp is None:
+        return seg.label_map(seg_img, prompts, erode=erode)
+    assert depth is not None, "warp requires the depth map to reproject masks into"
+    masks = warp_masks_to_depth_frame(
+        seg.masks(seg_img, prompts), depth, warp["K_ir"], warp["K_color"], warp["T_ir_color"])
+    return compose_label_map(masks, depth.shape, erode=erode)
 
 
 def _print_stats(stats, cloud):
@@ -179,12 +197,13 @@ def main(demo, from_file, live, serial, resolution, depth_source, ffs_mock, extr
         assert joints is not None, "--joints required for --live (EE pose via FK)"
         T_cam_base = np.load(extrinsic)
         ee_pos, ee_quat = _ee_pose_from_joints(_load_array(joints))
+        warp = None
         if depth_source == "ffs":
-            seg_img, depth, K, depth_scale = _capture_ffs(serial, resolution, ffs_mock)
+            seg_img, depth, K, depth_scale, warp = _capture_ffs(serial, resolution, ffs_mock)
         else:
             seg_img, depth, K, depth_scale = _capture_realsense(serial, resolution)
         if seg:
-            label_map = _segment(seg_img, sam2_ckpt, sam2_cfg, erode)
+            label_map = _segment(seg_img, sam2_ckpt, sam2_cfg, erode, depth=depth, warp=warp)
         mode = f"live:{depth_source}"
     else:
         raise click.UsageError("Pick one of --demo / --from-file / --live.")

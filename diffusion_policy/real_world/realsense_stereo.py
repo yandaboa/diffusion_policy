@@ -5,11 +5,13 @@ DISABLED (the dot pattern corrupts learned stereo matching). The existing
 ``SingleRealsense`` grabs a single IR stream and aligns to color, so this is a separate,
 minimal grabber used by ``ffs_depth_client`` / ``debug_pointcloud --depth-source ffs``.
 
-Returns (left-IR, right-IR, color, K_ir, baseline_m). FFS disparity is computed in the
-LEFT-IR frame, so ``K_ir`` (left infrared intrinsics) is the correct K for backprojecting
-the resulting depth. The sim cam->base extrinsic is for the color optical center; left-IR
-is offset from it by the small IR<->color baseline (~1-2 cm) -- ignored as part of the
-sim-extrinsic approximation (see POINTCLOUD_EVAL.md).
+Returns (left-IR, right-IR, color, K_ir, K_color, baseline_m, T_ir_color). FFS disparity is
+computed in the LEFT-IR frame, so ``K_ir`` (left infrared intrinsics) is the correct K for
+backprojecting the resulting depth. ``T_ir_color`` (left-IR -> color) lets a mask segmented
+on the COLOR image be reverse-warped into the IR/depth frame (SAM2 is far better on RGB than
+on raw IR -- see ``pointcloud_segmenter.warp_masks_to_depth_frame``). The sim cam->base
+extrinsic is for the color optical center; left-IR is offset from it by the small IR<->color
+baseline (~1-2 cm) -- ignored as part of the sim-extrinsic approximation (see POINTCLOUD_EVAL.md).
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ class StereoFrame:
     K_ir: np.ndarray        # (3, 3) left-IR intrinsics
     K_color: np.ndarray     # (3, 3) color intrinsics, or None
     baseline_m: float       # stereo baseline (metres)
+    T_ir_color: np.ndarray  # (4, 4) left-IR -> color transform, or None if want_color=False
 
 
 def capture_stereo(serial: str, resolution=(1280, 720), fps: int = 30,
@@ -59,9 +62,16 @@ def capture_stereo(serial: str, resolution=(1280, 720), fps: int = 30,
         baseline = abs(ir1.get_extrinsics_to(ir2).translation[0])  # metres
 
         K_color = None
+        T_ir_color = None
         if want_color:
-            ci = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            ci = color_profile.get_intrinsics()
             K_color = np.array([[ci.fx, 0, ci.ppx], [0, ci.fy, ci.ppy], [0, 0, 1.0]])
+            # left-IR -> color rigid transform (RealSense rotation is column-major).
+            ext = ir1.get_extrinsics_to(color_profile)
+            T_ir_color = np.eye(4)
+            T_ir_color[:3, :3] = np.array(ext.rotation).reshape(3, 3).T
+            T_ir_color[:3, 3] = np.array(ext.translation)
 
         fs = None
         for _ in range(max(1, warmup)):  # let auto-exposure settle
@@ -75,5 +85,5 @@ def capture_stereo(serial: str, resolution=(1280, 720), fps: int = 30,
     finally:
         pipe.stop()
 
-    return StereoFrame(left=left, right=right, color=color,
-                       K_ir=K_ir, K_color=K_color, baseline_m=float(baseline))
+    return StereoFrame(left=left, right=right, color=color, K_ir=K_ir, K_color=K_color,
+                       baseline_m=float(baseline), T_ir_color=T_ir_color)

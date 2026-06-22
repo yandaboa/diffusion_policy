@@ -239,6 +239,8 @@ export PYTHONPATH=/mnt/storage/lti/diffusion_policy
 **Step 1 — plumbing (no FFS weights, no SAM2).** Ramp ("mock") depth, so a wrong cloud
 points at a capture / extrinsic / joints bug rather than the depth model:
 
+SERIAL front - 215122255213
+
 ```bash
 python debug_pointcloud.py --live --depth-source ffs --ffs-mock \
     --resolution 848 480 --serial <SERIAL> \
