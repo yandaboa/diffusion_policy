@@ -1,0 +1,167 @@
+"""Build the PointNet observation cloud from a depth frame (see POINTCLOUD_EVAL.md).
+
+depth (+ SAM2 label map) -> backproject -> base frame -> EE (wrist_3_link) frame ->
+crop -> per-class budget sample -> (num_points, 4) = xyz + seg label.
+
+Depth-source-agnostic: ``depth`` may come from FFS, RealSense hardware depth, or DA3.
+Locked to ``pnocc_xl_residual_big_ee``: EE frame, 1024 pts, budget robot/peg/hole =
+512/256/256, labels {robot:0.0, peg:-1.0, hole:+1.0}.
+
+Conventions:
+  * depth registered to the RGB used for SAM2 (same HxW, same intrinsics K).
+  * K is the 3x3 color intrinsics; ``depth_scale`` converts raw depth -> metres.
+  * ``T_cam_base`` is the 4x4 camera->base extrinsic (point_base = T_cam_base @ point_cam).
+  * EE pose ``(ee_pos, ee_quat_wxyz)`` is wrist_3_link in base (from FK get_ee_pose).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+# Default deployment constants for pnocc_xl_residual_big_ee.
+SEG_LABELS = {"robot": 0.0, "peg": -1.0, "hole": 1.0}
+DEFAULT_BUDGET = {0.0: 512, -1.0: 256, 1.0: 256}  # label -> target count (sums to 1024)
+BG_LABEL = np.nan  # background / dropped points carry this in the label map
+
+
+@dataclass
+class CloudStats:
+    """Diagnostics for one built cloud (printed by debug_pointcloud.py)."""
+
+    n_raw_valid: int = 0          # valid depth pixels before labeling/crop
+    n_after_crop: int = 0         # points surviving the workspace crop
+    per_class_available: dict = field(default_factory=dict)  # label -> count found
+    per_class_realized: dict = field(default_factory=dict)   # label -> count emitted
+    short_classes: list = field(default_factory=list)        # classes that under-filled budget
+    bbox_min: Optional[np.ndarray] = None   # EE-frame AABB of the emitted cloud
+    bbox_max: Optional[np.ndarray] = None
+
+
+def backproject(depth: np.ndarray, K: np.ndarray, depth_scale: float = 1000.0):
+    """Backproject a depth image to camera-frame points.
+
+    Returns (points_cam (M,3) metres, pix_idx (M,) flat HxW index of each kept point)
+    for pixels with finite, positive depth.
+    """
+    depth = np.asarray(depth, np.float64).squeeze()
+    h, w = depth.shape
+    z = depth / depth_scale
+    us, vs = np.meshgrid(np.arange(w), np.arange(h))
+    x = (us - K[0, 2]) * z / K[0, 0]
+    y = (vs - K[1, 2]) * z / K[1, 1]
+    pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    zf = z.reshape(-1)
+    valid = np.isfinite(zf) & (zf > 0)
+    idx = np.nonzero(valid)[0]
+    return pts[idx], idx
+
+
+def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Apply a 4x4 homogeneous transform to (M,3) points."""
+    pts_h = np.concatenate([points, np.ones((points.shape[0], 1))], axis=1)
+    return (T @ pts_h.T).T[:, :3]
+
+
+def to_ee_frame(points_base: np.ndarray, ee_pos: np.ndarray, ee_quat_wxyz: np.ndarray) -> np.ndarray:
+    """Express base-frame points in the EE (wrist_3_link) frame.
+
+    Mirrors sim ``quat_apply(quat_inv(ref_quat), p - ref_pos)``: p_ee = R_ee^T (p_base - ee_pos).
+    """
+    w, x, y, z = ee_quat_wxyz
+    R_ee = R.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
+    return (points_base - np.asarray(ee_pos)) @ R_ee  # (p - t) @ R == R^T (p - t)
+
+
+def crop_aabb(points: np.ndarray, lo, hi, *extra):
+    """Keep points inside the axis-aligned box [lo, hi]; filter ``extra`` arrays in lockstep."""
+    lo, hi = np.asarray(lo), np.asarray(hi)
+    keep = np.all((points >= lo) & (points <= hi), axis=1)
+    out = [points[keep]] + [a[keep] for a in extra]
+    return tuple(out) if extra else out[0]
+
+
+def budget_sample(points: np.ndarray, labels: np.ndarray, budget: dict,
+                  pad: str = "repeat", rng: Optional[np.random.Generator] = None):
+    """Sample a fixed per-class number of points.
+
+    For each ``label -> target`` in ``budget``: random-sample ``target`` of that class.
+    If fewer than ``target`` are available, ``pad`` controls the fill:
+      * "repeat" -- sample with replacement to reach target (keeps N fixed; recommended)
+      * "short"  -- emit only what's available (N may be < sum(budget))
+    Returns (coords (N,3), labels (N,), per_available dict, short_list).
+    """
+    rng = rng or np.random.default_rng()
+    out_pts, out_lab, available, short = [], [], {}, []
+    for label, target in budget.items():
+        sel = np.nonzero(labels == label)[0]
+        available[label] = int(sel.size)
+        if sel.size == 0:
+            short.append(label)
+            continue
+        if sel.size >= target:
+            pick = rng.choice(sel, size=target, replace=False)
+        elif pad == "repeat":
+            pick = rng.choice(sel, size=target, replace=True)
+            short.append(label)
+        else:  # "short"
+            pick = sel
+            short.append(label)
+        out_pts.append(points[pick])
+        out_lab.append(np.full(pick.shape[0], label, np.float32))
+    coords = np.concatenate(out_pts, axis=0) if out_pts else np.zeros((0, 3), np.float32)
+    labs = np.concatenate(out_lab, axis=0) if out_lab else np.zeros((0,), np.float32)
+    return coords.astype(np.float32), labs.astype(np.float32), available, short
+
+
+def build_cloud(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
+                depth_scale: float = 1000.0, crop_lo=None, crop_hi=None,
+                budget: Optional[dict] = None, pad: str = "repeat",
+                rng: Optional[np.random.Generator] = None):
+    """Full pipeline: depth (+ labels) -> (num_points, 4) EE-frame segmented cloud.
+
+    Args:
+        label_map: (H, W) per-pixel seg label aligned with ``depth`` (values in
+            SEG_LABELS, background = NaN). If None, all kept points get label 0.0 and
+            no per-class budgeting is applied (geometry-only debug mode).
+        budget: label -> count. Defaults to DEFAULT_BUDGET when ``label_map`` is given.
+        crop_lo/crop_hi: AABB bounds in the EE frame (metres) applied after transform.
+    Returns:
+        cloud (N, 4) float32 [x, y, z, label], CloudStats.
+    """
+    stats = CloudStats()
+    pts_cam, pix_idx = backproject(depth, K, depth_scale)
+    stats.n_raw_valid = int(pix_idx.size)
+
+    pts_base = transform_points(pts_cam, np.asarray(T_cam_base, np.float64))
+    pts_ee = to_ee_frame(pts_base, ee_pos, ee_quat_wxyz)
+
+    if label_map is not None:
+        labels = np.asarray(label_map, np.float32).reshape(-1)[pix_idx]
+        keep = np.isfinite(labels)  # drop background pixels
+        pts_ee, labels = pts_ee[keep], labels[keep]
+    else:
+        labels = np.zeros(pts_ee.shape[0], np.float32)
+
+    if crop_lo is not None and crop_hi is not None:
+        pts_ee, labels = crop_aabb(pts_ee, crop_lo, crop_hi, labels)
+    stats.n_after_crop = int(pts_ee.shape[0])
+
+    if label_map is None:
+        coords, labs = pts_ee.astype(np.float32), labels
+        stats.per_class_available = {0.0: int(coords.shape[0])}
+        stats.per_class_realized = {0.0: int(coords.shape[0])}
+    else:
+        budget = budget or DEFAULT_BUDGET
+        coords, labs, available, short = budget_sample(pts_ee, labels, budget, pad, rng)
+        stats.per_class_available = available
+        stats.per_class_realized = {lab: int((labs == lab).sum()) for lab in budget}
+        stats.short_classes = short
+
+    if coords.shape[0]:
+        stats.bbox_min, stats.bbox_max = coords.min(0), coords.max(0)
+    cloud = np.concatenate([coords, labs[:, None]], axis=1).astype(np.float32)
+    return cloud, stats
