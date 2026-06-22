@@ -16,6 +16,7 @@ baseline (~1-2 cm) -- ignored as part of the sim-extrinsic approximation (see PO
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -32,9 +33,17 @@ class StereoFrame:
     T_ir_color: np.ndarray  # (4, 4) left-IR -> color transform, or None if want_color=False
 
 
-def capture_stereo(serial: str, resolution=(1280, 720), fps: int = 30,
-                   warmup: int = 30, want_color: bool = True) -> StereoFrame:
-    """Grab one rectified IR stereo pair (emitter off) + optional color from a D4xx."""
+@contextmanager
+def open_stereo_stream(serial: str, resolution=(1280, 720), fps: int = 30,
+                       warmup: int = 30, want_color: bool = True):
+    """Open a persistent D4xx stereo-IR (+color) stream; yield a ``grab() -> StereoFrame``.
+
+    Unlike ``capture_stereo`` (one-shot: pipeline start/stop + warmup on every call), this keeps
+    the pipeline open so a hot loop can pull frames at sensor rate -- needed by the real-time
+    path (``debug_pointcloud.py --video``). Intrinsics / baseline / ``T_ir_color`` are computed
+    once at open and reused on every ``grab()``; the emitter is disabled (clean pair for FFS) and
+    auto-exposure is settled before the first frame is returned.
+    """
     import pyrealsense2 as rs
 
     w, h = resolution
@@ -73,17 +82,26 @@ def capture_stereo(serial: str, resolution=(1280, 720), fps: int = 30,
             T_ir_color[:3, :3] = np.array(ext.rotation).reshape(3, 3).T
             T_ir_color[:3, 3] = np.array(ext.translation)
 
-        fs = None
-        for _ in range(max(1, warmup)):  # let auto-exposure settle
-            fs = pipe.wait_for_frames()
+        for _ in range(max(1, warmup)):  # let auto-exposure settle before first grab
+            pipe.wait_for_frames()
 
-        left = np.asarray(fs.get_infrared_frame(1).get_data())
-        right = np.asarray(fs.get_infrared_frame(2).get_data())
-        color = None
-        if want_color:
-            color = np.asarray(fs.get_color_frame().get_data())[..., ::-1].copy()  # BGR->RGB
+        def grab() -> StereoFrame:
+            fs = pipe.wait_for_frames()
+            left = np.asarray(fs.get_infrared_frame(1).get_data())
+            right = np.asarray(fs.get_infrared_frame(2).get_data())
+            color = None
+            if want_color:
+                color = np.asarray(fs.get_color_frame().get_data())[..., ::-1].copy()  # BGR->RGB
+            return StereoFrame(left=left, right=right, color=color, K_ir=K_ir, K_color=K_color,
+                               baseline_m=float(baseline), T_ir_color=T_ir_color)
+
+        yield grab
     finally:
         pipe.stop()
 
-    return StereoFrame(left=left, right=right, color=color, K_ir=K_ir, K_color=K_color,
-                       baseline_m=float(baseline), T_ir_color=T_ir_color)
+
+def capture_stereo(serial: str, resolution=(1280, 720), fps: int = 30,
+                   warmup: int = 30, want_color: bool = True) -> StereoFrame:
+    """Grab one rectified IR stereo pair (emitter off) + optional color from a D4xx."""
+    with open_stereo_stream(serial, resolution, fps, warmup=warmup, want_color=want_color) as grab:
+        return grab()

@@ -1,10 +1,13 @@
 # Online robot-arm segmentation during eval (design notes)
 
-Status: **not implemented.** `segment_pointclouds.py` is the offline (post-process)
-path used for calibration. This doc sketches how to do the same thing *live* during
-eval, if/when the eval pipeline needs arm-only points online (e.g. as policy input or
-for live perception-gap monitoring). Until then, keep recording raw clouds + joints
-and segment offline.
+Status: **de-risk tool built; eval-pipeline integration not done.** A standalone real-time
+test now exists — `debug_pointcloud.py --video` (Option A below): it holds the camera open,
+prompts SAM2 once on the first frame, then `track()`s every subsequent frame with the
+streaming predictor (`real_world/pointcloud_segmenter.py::StreamingSegmenter`), rebuilds the
+segmented cloud per frame, and saves an annotated MP4 with a per-stage latency / FPS HUD so
+you can eyeball both mask-tracking quality and whether it clears the control loop. What's
+still **not done** is wiring this into the actual eval loop (`depth_recorder.py`) as policy
+input. `segment_pointclouds.py` remains the offline (post-process) path used for calibration.
 
 ## Why offline ≠ online here
 
@@ -50,9 +53,14 @@ obj_ids, mask_logits = predictor.track(left_ir_rgb)   # uses memory, no re-promp
 mask = (mask_logits[0, 0] > 0).cpu().numpy()
 ```
 
-Install into `foundstereo` in a way that does **not** clobber the current `sam2`
-(pin/venv or a separate import path), since the offline script depends on the
-official package.
+The fork is a **superset** of the official package (still ships `sam2_image_predictor`,
+`sam2_video_predictor`, and the sam2.1 configs/checkpoints), so it can simply **replace** the
+official `sam2` in `foundstereo` — the offline `segment_pointclouds.py` and the image-predictor
+`PointCloudSegmenter` keep working. Swap cleanly: `pip uninstall -y SAM-2 sam2` then
+`pip install -e .` against the fork (rebuilds the CUDA postproc ext). Re-run the offline path
+once after swapping; masks may differ slightly (older upstream snapshot).
+
+This is what `StreamingSegmenter` + `debug_pointcloud.py --video` use today.
 
 ## Option B — adapt the official video predictor (no new dep)
 

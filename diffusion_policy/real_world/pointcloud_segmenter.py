@@ -99,6 +99,79 @@ class PointCloudSegmenter:
         return compose_label_map(self.masks(rgb, prompts), (h, w), erode=erode)
 
 
+class StreamingSegmenter:
+    """SAM2 streaming camera predictor: prompt the first frame once, then track each new frame.
+
+    This is the real-time sibling of ``PointCloudSegmenter`` (image predictor, re-prompted per
+    frame) for the moving-arm case: clicking the same pixel every frame drifts off a moving
+    object, so instead we seed SAM2's memory bank once and let it propagate causally. Used by
+    ``debug_pointcloud.py --video`` to de-risk the online seg + point-masking loop.
+
+    Requires the streaming fork (``Gy920/segment-anything-2-real-time``), which adds
+    ``build_sam2_camera_predictor`` to ``sam2.build_sam``. That package is a *superset* of the
+    official one -- the image predictor (``PointCloudSegmenter``) and offline video predictor
+    (``segment_pointclouds.py``) still import and run -- so it may replace the official ``sam2``
+    in the perception env. See ``online_segmentation.md``.
+
+    Multi-class: each prompted class gets its own SAM2 ``obj_id``; ``track`` returns one mask
+    per class, keyed by name (composable with ``compose_label_map`` / ``warp_masks_to_depth_frame``
+    exactly like the image-predictor masks).
+    """
+
+    def __init__(self, checkpoint: str, model_cfg: str, device: str = None):
+        import torch
+        from sam2.build_sam import build_sam2_camera_predictor
+        self._torch = torch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.predictor = build_sam2_camera_predictor(model_cfg, checkpoint, device=self.device)
+        self._obj_to_name: dict = {}  # SAM2 obj_id -> class name
+
+    def _autocast(self):
+        torch = self._torch
+        return (torch.autocast(self.device, dtype=torch.bfloat16)
+                if self.device == "cuda" else torch.no_grad())
+
+    def start(self, rgb: np.ndarray, prompts: dict) -> dict:
+        """Seed the first frame. ``prompts``: {class_name -> (pos, neg)} (clicks as [x, y]).
+
+        Classes with no positive clicks are skipped. Returns the frame-0 masks dict
+        {class_name -> (H, W) bool}.
+        """
+        torch = self._torch
+        self._obj_to_name = {}
+        last = None
+        with torch.inference_mode(), self._autocast():
+            self.predictor.load_first_frame(rgb)  # SAM2 expects RGB
+            obj_id = 0
+            for name, (pos, neg) in prompts.items():
+                if not pos:
+                    continue
+                obj_id += 1
+                self._obj_to_name[obj_id] = name
+                points = np.array(list(pos) + list(neg), np.float32)
+                labels = np.array([1] * len(pos) + [0] * len(neg), np.int32)
+                last = self.predictor.add_new_prompt(
+                    frame_idx=0, obj_id=obj_id, points=points, labels=labels)
+        # add_new_prompt -> (frame_idx, obj_ids, video_res_masks); last call has every object.
+        return self._masks_from(last[1], last[2]) if last is not None else {}
+
+    def track(self, rgb: np.ndarray) -> dict:
+        """Track the next frame using accumulated memory. Returns {class_name -> (H, W) bool}."""
+        torch = self._torch
+        with torch.inference_mode(), self._autocast():
+            obj_ids, mask_logits = self.predictor.track(rgb)  # track -> (obj_ids, masks)
+        return self._masks_from(obj_ids, mask_logits)
+
+    def _masks_from(self, obj_ids, mask_logits) -> dict:
+        """(obj_ids, (N,1,H,W) logits) -> {class_name -> (H, W) bool}, dropping unknown ids."""
+        out = {}
+        for i, oid in enumerate(obj_ids):
+            name = self._obj_to_name.get(int(oid))
+            if name is not None:
+                out[name] = (mask_logits[i, 0] > 0.0).cpu().numpy().astype(bool)
+        return out
+
+
 def warp_masks_to_depth_frame(masks: dict, depth: np.ndarray, K_depth: np.ndarray,
                               K_color: np.ndarray, T_depth_color: np.ndarray) -> dict:
     """Reverse-warp color-frame bool masks into the depth camera's pixel grid.
