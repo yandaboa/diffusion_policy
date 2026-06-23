@@ -165,3 +165,128 @@ def build_cloud(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
         stats.bbox_min, stats.bbox_max = coords.min(0), coords.max(0)
     cloud = np.concatenate([coords, labs[:, None]], axis=1).astype(np.float32)
     return cloud, stats
+
+
+# --- torch / GPU pipeline -------------------------------------------------------------------
+# Mirrors the numpy path above op-for-op (same frames, conventions, budget) but keeps everything
+# on the device so SAM2 masks + depth never round-trip to host. depth/label_map are torch tensors
+# already on the device; K / T_cam_base / ee_* stay small numpy/array inputs (read as scalars).
+
+
+def backproject_torch(depth, K, depth_scale: float = 1000.0):
+    """torch twin of ``backproject``: (H,W) depth tensor -> (pts_cam (M,3), pix_idx (M,))."""
+    import torch
+    depth = depth.squeeze()
+    h, w = depth.shape
+    z = depth.to(torch.float32) / depth_scale
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    us, vs = torch.meshgrid(
+        torch.arange(w, device=depth.device, dtype=torch.float32),
+        torch.arange(h, device=depth.device, dtype=torch.float32), indexing="xy")
+    x = (us - cx) * z / fx
+    y = (vs - cy) * z / fy
+    pts = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+    zf = z.reshape(-1)
+    valid = torch.isfinite(zf) & (zf > 0)
+    idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+    return pts[idx], idx
+
+
+def transform_points_torch(points, T):
+    """Apply a 4x4 homogeneous transform to (M,3) torch points: p @ R^T + t."""
+    import torch
+    T = torch.as_tensor(T, dtype=points.dtype, device=points.device)
+    return points @ T[:3, :3].T + T[:3, 3]
+
+
+def to_ee_frame_torch(points_base, ee_pos, ee_quat_wxyz):
+    """torch twin of ``to_ee_frame``: p_ee = R_ee^T (p_base - ee_pos), quat is wxyz."""
+    import torch
+    w, x, y, z = (float(v) for v in ee_quat_wxyz)
+    R_ee = torch.tensor([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ], dtype=points_base.dtype, device=points_base.device)
+    t = torch.as_tensor(ee_pos, dtype=points_base.dtype, device=points_base.device)
+    return (points_base - t) @ R_ee  # (p - t) @ R == R^T (p - t)
+
+
+def crop_aabb_torch(points, lo, hi, *extra):
+    """Keep points inside [lo, hi]; filter ``extra`` tensors in lockstep."""
+    import torch
+    lo = torch.as_tensor(lo, dtype=points.dtype, device=points.device)
+    hi = torch.as_tensor(hi, dtype=points.dtype, device=points.device)
+    keep = ((points >= lo) & (points <= hi)).all(dim=1)
+    out = [points[keep]] + [a[keep] for a in extra]
+    return tuple(out) if extra else out[0]
+
+
+def budget_sample_torch(points, labels, budget: dict, pad: str = "repeat", generator=None):
+    """torch twin of ``budget_sample``: fixed per-class sampling on-device."""
+    import torch
+    dev = points.device
+    out_pts, out_lab, available, short = [], [], {}, []
+    for label, target in budget.items():
+        sel = torch.nonzero(labels == label, as_tuple=False).squeeze(1)
+        n = int(sel.numel())
+        available[label] = n
+        if n == 0:
+            short.append(label)
+            continue
+        if n >= target:
+            pick = sel[torch.randperm(n, device=dev, generator=generator)[:target]]
+        elif pad == "repeat":
+            pick = sel[torch.randint(0, n, (target,), device=dev, generator=generator)]
+            short.append(label)
+        else:  # "short"
+            pick = sel
+            short.append(label)
+        out_pts.append(points[pick])
+        out_lab.append(torch.full((pick.numel(),), float(label), dtype=torch.float32, device=dev))
+    coords = torch.cat(out_pts, 0) if out_pts else torch.zeros((0, 3), dtype=torch.float32, device=dev)
+    labs = torch.cat(out_lab, 0) if out_lab else torch.zeros((0,), dtype=torch.float32, device=dev)
+    return coords.to(torch.float32), labs, available, short
+
+
+def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
+                      depth_scale: float = 1000.0, crop_lo=None, crop_hi=None,
+                      budget: Optional[dict] = None, pad: str = "repeat", generator=None):
+    """On-device twin of ``build_cloud``: depth tensor (+ label_map tensor) -> (cloud (N,4)
+    float32 tensor, CloudStats). bbox stats are pulled to host (small); the cloud stays on-device."""
+    import torch
+    stats = CloudStats()
+    pts_cam, pix_idx = backproject_torch(depth, K, depth_scale)
+    stats.n_raw_valid = int(pix_idx.numel())
+
+    pts_base = transform_points_torch(pts_cam, T_cam_base)
+    pts_ee = to_ee_frame_torch(pts_base, ee_pos, ee_quat_wxyz)
+
+    if label_map is not None:
+        labels = label_map.reshape(-1)[pix_idx]
+        keep = torch.isfinite(labels)  # drop background pixels
+        pts_ee, labels = pts_ee[keep], labels[keep]
+    else:
+        labels = torch.zeros(pts_ee.shape[0], dtype=torch.float32, device=pts_ee.device)
+
+    if crop_lo is not None and crop_hi is not None:
+        pts_ee, labels = crop_aabb_torch(pts_ee, crop_lo, crop_hi, labels)
+    stats.n_after_crop = int(pts_ee.shape[0])
+
+    if label_map is None:
+        coords, labs = pts_ee.to(torch.float32), labels
+        stats.per_class_available = {0.0: int(coords.shape[0])}
+        stats.per_class_realized = {0.0: int(coords.shape[0])}
+    else:
+        budget = budget or DEFAULT_BUDGET
+        coords, labs, available, short = budget_sample_torch(pts_ee, labels, budget, pad, generator)
+        stats.per_class_available = available
+        stats.per_class_realized = {lab: int((labs == lab).sum()) for lab in budget}
+        stats.short_classes = short
+
+    if coords.shape[0]:
+        stats.bbox_min = coords.min(0).values.detach().cpu().numpy()
+        stats.bbox_max = coords.max(0).values.detach().cpu().numpy()
+    cloud = torch.cat([coords, labs[:, None]], dim=1).to(torch.float32)
+    return cloud, stats

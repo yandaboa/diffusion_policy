@@ -174,17 +174,54 @@ def _draw_video_frame(color_rgb, masks, stats, timings, frame_idx, fps_avg):
     return bgr
 
 
+def _print_timing_summary(timing_log, n_frames):
+    """Per-stage latency breakdown over the whole run. Stages are wall-clock (perf_counter);
+    GPU stages (depth, track) block on their result, so their wall time includes device sync."""
+    if not timing_log or n_frames == 0:
+        return
+    preferred = ("grab", "depth", "track", "warp", "build")
+    order = [k for k in preferred if k in timing_log] + \
+            [k for k in timing_log if k not in preferred]
+    means = {k: float(np.mean(timing_log[k])) for k in order}
+    total_mean = sum(means.values())
+    click.echo("")
+    click.echo(f"[profile] per-stage latency over {len(next(iter(timing_log.values())))} "
+               f"frames (ms):")
+    click.echo(f"  {'stage':>6}  {'mean':>7} {'med':>7} {'p95':>7} {'min':>7} {'max':>7}  {'%tot':>5}")
+    for k in order:
+        a = np.asarray(timing_log[k], dtype=float)
+        pct = 100.0 * means[k] / max(total_mean, 1e-6)
+        click.echo(f"  {k:>6}  {means[k]:7.1f} {np.median(a):7.1f} {np.percentile(a, 95):7.1f} "
+                   f"{a.min():7.1f} {a.max():7.1f}  {pct:5.1f}")
+    click.echo(f"  {'TOTAL':>6}  {total_mean:7.1f} {'':7} {'':7} {'':7} {'':7}  "
+               f"-> {1000.0 / max(total_mean, 1e-6):.1f} FPS")
+    click.echo("  note: 'depth' is the residual wait after track -- FFS depth runs in its own "
+               "process,\n        overlapped with SAM2 track, so its true compute is mostly hidden "
+               "under 'track'.")
+
+
 def _run_video(depth_source, serial, resolution, ffs_mock, T_cam_base, ee_pos, ee_quat,
                sam2_ckpt, sam2_cfg, erode, crop_lo, crop_hi, video_out, video_fps,
                duration, max_frames):
     """Hold the camera open, prompt SAM2 once, track + rebuild the cloud per frame, save an MP4."""
     import cv2
+    import torch
     from diffusion_policy.real_world.pointcloud_segmenter import (
-        StreamingSegmenter, compose_label_map, pick_prompts_interactive,
-        warp_masks_to_depth_frame)
+        StreamingSegmenter, compose_label_map_torch, pick_prompts_interactive,
+        warp_masks_to_depth_frame_torch)
+
+    def _sync():
+        # GPU stages are timed by wall clock; sync so each stage's time isn't absorbed by the
+        # next forced read (debug profiling only -- deployment wouldn't sync per stage).
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     with contextlib.ExitStack() as stack:
-        # --- persistent frame source: returns (color RGB, depth, K, units/m, warp, (t_grab, t_depth)) ---
+        # --- persistent frame source ---------------------------------------------------------
+        # grab() captures color/stereo and *kicks off* depth (async on the FFS worker), returning
+        # (color, K, units/m, warp, t_grab). collect_depth() reaps it -> (depth, t_depth_wait).
+        # Splitting the two lets SAM2 tracking run in this process while depth computes in its own
+        # process, so depth overlaps track instead of running serially before it.
         if depth_source == "ffs":
             from diffusion_policy.real_world.realsense_stereo import open_stereo_stream
             from diffusion_policy.real_world.ffs_depth_client import FFSDepthClient
@@ -196,57 +233,87 @@ def _run_video(depth_source, serial, resolution, ffs_mock, T_cam_base, ee_pos, e
                 t0 = time.perf_counter()
                 f = grab_stereo()
                 t1 = time.perf_counter()
-                depth = ffs.infer(f.left, f.right, f.K_ir, f.baseline_m)  # metres
-                t2 = time.perf_counter()
+                ffs.submit(f.left, f.right, f.K_ir, f.baseline_m)  # depth runs while we track
                 warp = {"K_ir": f.K_ir, "K_color": f.K_color, "T_ir_color": f.T_ir_color}
-                return f.color, depth, f.K_ir, 1.0, warp, (1e3 * (t1 - t0), 1e3 * (t2 - t1))
+                return f.color, f.K_ir, 1.0, warp, 1e3 * (t1 - t0)
+
+            def collect_depth():
+                t0 = time.perf_counter()
+                depth = ffs.collect()  # residual wait after track (~0 if depth finished first)
+                return depth, 1e3 * (time.perf_counter() - t0)
         else:
             grab_rs = stack.enter_context(_open_realsense_stream(serial, resolution))
+            _pending = {}
 
             def grab():
                 t0 = time.perf_counter()
-                color, depth, K, ups = grab_rs()
-                return color, depth, K, ups, None, (1e3 * (time.perf_counter() - t0), 0.0)
+                color, depth, K, ups = grab_rs()  # hardware depth: synchronous, no overlap
+                _pending["depth"] = depth
+                return color, K, ups, None, 1e3 * (time.perf_counter() - t0)
+
+            def collect_depth():
+                return _pending.pop("depth"), 0.0
 
         # --- frame 0: prompt SAM2 once and seed the tracker ---
-        color, depth, K, depth_scale, warp, (t_grab, t_depth) = grab()
+        color, K, depth_scale, warp, t_grab = grab()  # depth submitted; reaped after start()
         prompts = pick_prompts_interactive(color)
         if not prompts:
             raise click.UsageError("--video needs at least one class clicked on the first frame")
         click.echo(f"  [seg] streaming classes: {list(prompts)} (tracking, no re-clicking)")
         seg = StreamingSegmenter(sam2_ckpt, sam2_cfg)
+        device = seg.device
         t0 = time.perf_counter()
-        masks = seg.start(color, prompts)
+        masks = seg.start(color, prompts)  # {name -> (H,W) bool tensor on device}
+        _sync()
         t_track = 1e3 * (time.perf_counter() - t0)
+        depth, t_depth = collect_depth()
 
         writer, n, t_start, cum_ms, fps_avg = None, 0, time.perf_counter(), 0.0, 0.0
+        timing_log = {}
         try:
             while True:
                 if n > 0:  # frame 0 already grabbed + seeded above
-                    color, depth, K, depth_scale, warp, (t_grab, t_depth) = grab()
+                    color, K, depth_scale, warp, t_grab = grab()  # kicks off depth (async)
                     t0 = time.perf_counter()
-                    masks = seg.track(color)
+                    masks = seg.track(color)  # GPU bool tensors; runs while depth computes
+                    _sync()
                     t_track = 1e3 * (time.perf_counter() - t0)
+                    depth, t_depth = collect_depth()  # residual wait, overlapped with track
 
-                # masks (color frame) -> label map aligned to depth -> cloud
-                t0 = time.perf_counter()
-                if warp is None:
-                    label_map = compose_label_map(masks, depth.shape, erode=erode)
-                else:
-                    masks_depth = warp_masks_to_depth_frame(
-                        masks, depth, warp["K_ir"], warp["K_color"], warp["T_ir_color"])
-                    label_map = compose_label_map(masks_depth, depth.shape, erode=erode)
-                _, stats = B.build_cloud(
-                    depth, K, T_cam_base, ee_pos, ee_quat, label_map=label_map,
-                    depth_scale=depth_scale, crop_lo=crop_lo, crop_hi=crop_hi)
-                t_build = 1e3 * (time.perf_counter() - t0)
+                # masks (color frame) -> label map aligned to depth -> cloud, all on-device.
+                # depth is host numpy (FFS worker / RealSense); upload once, timed under `warp`.
+                with torch.inference_mode():
+                    t0 = time.perf_counter()
+                    depth_t = torch.as_tensor(
+                        np.ascontiguousarray(depth), device=device, dtype=torch.float32)
+                    if warp is None:
+                        label_map = compose_label_map_torch(masks, depth.shape, erode=erode,
+                                                            device=device)
+                    else:
+                        masks_depth = warp_masks_to_depth_frame_torch(
+                            masks, depth_t, warp["K_ir"], warp["K_color"], warp["T_ir_color"])
+                        label_map = compose_label_map_torch(masks_depth, depth.shape, erode=erode,
+                                                            device=device)
+                    _sync()
+                    t_warp = 1e3 * (time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    _cloud, stats = B.build_cloud_torch(
+                        depth_t, K, T_cam_base, ee_pos, ee_quat, label_map=label_map,
+                        depth_scale=depth_scale, crop_lo=crop_lo, crop_hi=crop_hi)
+                    _sync()
+                    t_build = 1e3 * (time.perf_counter() - t0)
 
                 # fps_avg from accumulated per-frame work (consistent from frame 0; excludes the
                 # one-time interactive prompt). duration check uses wall clock since loop start.
-                timings = {"grab": t_grab, "depth": t_depth, "track": t_track, "build": t_build}
+                timings = {"grab": t_grab, "depth": t_depth, "track": t_track,
+                           "warp": t_warp, "build": t_build}
                 cum_ms += sum(timings.values())
+                for _stage, _ms in timings.items():
+                    timing_log.setdefault(_stage, []).append(_ms)
                 fps_avg = 1000.0 * (n + 1) / max(cum_ms, 1e-6)
-                frame = _draw_video_frame(color, masks, stats, timings, n, fps_avg)
+                # masks -> host bools for the overlay only (untimed; deployment has no draw step)
+                masks_np = {k: v.detach().cpu().numpy() for k, v in masks.items()}
+                frame = _draw_video_frame(color, masks_np, stats, timings, n, fps_avg)
 
                 if writer is None:
                     h, w = frame.shape[:2]
@@ -267,6 +334,7 @@ def _run_video(depth_source, serial, resolution, ffs_mock, T_cam_base, ee_pos, e
         finally:
             if writer is not None:
                 writer.release()
+            _print_timing_summary(timing_log, n)
 
     click.echo(f"[debug_pointcloud] wrote {n} frames @ {fps_avg:.1f} FPS avg -> {video_out}")
 

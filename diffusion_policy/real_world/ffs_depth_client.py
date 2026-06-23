@@ -85,9 +85,13 @@ class FFSDepthClient:
             time.sleep(0.01)
         self._state[0] = _IDLE
 
-    def infer(self, left: np.ndarray, right: np.ndarray, K: np.ndarray,
-              baseline: float, timeout: float = 10.0) -> np.ndarray:
-        """Rectified IR stereo pair -> metric depth (H, W) float32, metres (left-IR frame)."""
+    def submit(self, left: np.ndarray, right: np.ndarray, K: np.ndarray,
+               baseline: float) -> None:
+        """Kick off async depth inference and return immediately. Pair with ``collect``.
+
+        Lets the caller run other GPU work (e.g. SAM2 tracking) while the worker computes depth,
+        then reap the result with ``collect``. Only one inference may be in flight at a time.
+        """
         left = np.ascontiguousarray(left, np.uint8)
         right = np.ascontiguousarray(right, np.uint8)
         h, w = left.shape
@@ -98,6 +102,8 @@ class FFSDepthClient:
         self._right[:h * w] = right.reshape(-1)
         self._state[0] = _FRAME_READY
 
+    def collect(self, timeout: float = 10.0) -> np.ndarray:
+        """Block until the depth submitted by ``submit`` is ready -> (H, W) float32 metres."""
         t0 = time.time()
         while int(self._state[0]) != int(_DEPTH_READY):
             if self._proc.poll() is not None:
@@ -109,6 +115,12 @@ class FFSDepthClient:
         depth = self._depth[:oh * ow].reshape(oh, ow).copy()
         self._state[0] = _IDLE
         return depth
+
+    def infer(self, left: np.ndarray, right: np.ndarray, K: np.ndarray,
+              baseline: float, timeout: float = 10.0) -> np.ndarray:
+        """Blocking submit + collect (rectified IR stereo pair -> metric depth, left-IR frame)."""
+        self.submit(left, right, K, baseline)
+        return self.collect(timeout)
 
     def stop(self) -> None:
         if self._state is not None:

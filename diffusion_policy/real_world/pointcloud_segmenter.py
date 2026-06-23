@@ -163,12 +163,17 @@ class StreamingSegmenter:
         return self._masks_from(obj_ids, mask_logits)
 
     def _masks_from(self, obj_ids, mask_logits) -> dict:
-        """(obj_ids, (N,1,H,W) logits) -> {class_name -> (H, W) bool}, dropping unknown ids."""
+        """(obj_ids, (N,1,H,W) logits) -> {class_name -> (H, W) bool tensor}, dropping unknown ids.
+
+        Masks stay on the SAM2 device (no host round-trip): the GPU pipeline
+        (``warp_masks_to_depth_frame_torch`` / ``compose_label_map_torch``) consumes them directly.
+        Call ``.cpu().numpy()`` yourself if you need host bools (e.g. for drawing).
+        """
         out = {}
         for i, oid in enumerate(obj_ids):
             name = self._obj_to_name.get(int(oid))
             if name is not None:
-                out[name] = (mask_logits[i, 0] > 0.0).cpu().numpy().astype(bool)
+                out[name] = mask_logits[i, 0] > 0.0  # (H, W) bool tensor on device
         return out
 
 
@@ -217,6 +222,69 @@ def warp_masks_to_depth_frame(masks: dict, depth: np.ndarray, K_depth: np.ndarra
         hc, wc = m.shape
         in_b = safe & (uc >= 0) & (uc < wc) & (vc >= 0) & (vc < hc)
         warped = np.zeros((h, w), bool)
+        warped[in_b] = m[vc[in_b], uc[in_b]]
+        out[name] = warped
+    return out
+
+
+def _erode_torch(mask, px: int):
+    """Erode a bool mask by ``px`` with a square SE (twin of ``_erode``): erosion = NOT dilate(NOT)."""
+    import torch
+    import torch.nn.functional as F
+    if px <= 0:
+        return mask
+    inv = (~mask).float()[None, None]
+    dil = F.max_pool2d(inv, kernel_size=2 * px + 1, stride=1, padding=px) > 0
+    return ~dil[0, 0]
+
+
+def compose_label_map_torch(masks: dict, shape, erode: int = 3, device=None):
+    """torch twin of ``compose_label_map``: {name -> (H,W) bool tensor} -> (H,W) float32 label map
+    (NaN = background) on ``device`` (defaults to the masks' device)."""
+    import torch
+    first = next(iter(masks.values()), None)
+    dev = device or (first.device if first is not None else "cpu")
+    label_map = torch.full(tuple(shape), float("nan"), dtype=torch.float32, device=dev)
+    for name in _COMPOSE_ORDER:
+        m = masks.get(name)
+        if m is None:
+            continue
+        m = _erode_torch(m.bool(), erode)
+        label_map[m] = SEG_LABELS[name]
+    return label_map
+
+
+def warp_masks_to_depth_frame_torch(masks: dict, depth, K_depth, K_color, T_depth_color) -> dict:
+    """On-device twin of ``warp_masks_to_depth_frame``. ``depth`` is a (H,W) tensor on the device;
+    ``masks`` are color-frame (Hc,Wc) bool tensors. Returns {name -> (H,W) bool tensor} on the
+    depth grid. K_* / T_* are read as scalars, so plain numpy arrays are fine."""
+    import torch
+    h, w = depth.shape
+    dev = depth.device
+    vv, uu = torch.meshgrid(
+        torch.arange(h, device=dev, dtype=torch.float32),
+        torch.arange(w, device=dev, dtype=torch.float32), indexing="ij")
+    z = depth.to(torch.float32)
+    valid = torch.isfinite(z) & (z > 0)
+
+    x = (uu - float(K_depth[0, 2])) / float(K_depth[0, 0]) * z
+    y = (vv - float(K_depth[1, 2])) / float(K_depth[1, 1]) * z
+    pts = torch.stack([x, y, z], dim=-1)  # (H, W, 3) in the depth frame
+
+    T = torch.as_tensor(T_depth_color, dtype=torch.float32, device=dev)
+    pc = pts @ T[:3, :3].T + T[:3, 3]
+    zc = pc[..., 2]
+    safe = valid & (zc > 0)
+    zc_safe = torch.where(safe, zc, torch.ones_like(zc))
+    uc = torch.round(pc[..., 0] / zc_safe * float(K_color[0, 0]) + float(K_color[0, 2])).long()
+    vc = torch.round(pc[..., 1] / zc_safe * float(K_color[1, 1]) + float(K_color[1, 2])).long()
+
+    out = {}
+    for name, m in masks.items():
+        m = m.bool()
+        hc, wc = m.shape
+        in_b = safe & (uc >= 0) & (uc < wc) & (vc >= 0) & (vc < hc)
+        warped = torch.zeros((h, w), dtype=torch.bool, device=dev)
         warped[in_b] = m[vc[in_b], uc[in_b]]
         out[name] = warped
     return out
