@@ -1,4 +1,5 @@
 from typing import Optional
+import contextlib
 import pathlib
 import numpy as np
 import time
@@ -10,7 +11,7 @@ from diffusion_policy.real_world.rtde_interpolation_controller import RTDEInterp
 from diffusion_policy.real_world.multi_realsense import MultiRealsense, SingleRealsense
 from diffusion_policy.real_world.video_recorder import VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
-    TimestampObsAccumulator, 
+    TimestampObsAccumulator,
     TimestampActionAccumulator,
     align_timestamps
 )
@@ -18,7 +19,8 @@ from diffusion_policy.real_world.multi_camera_visualizer import MultiCameraVisua
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.cv2_util import (
     get_image_transform, optimal_row_cols)
-from diffusion_policy.real_world.ur5e_kinematics import axis_angle_to_quat
+from diffusion_policy.real_world.ur5e_kinematics import (
+    axis_angle_to_quat, get_ee_pose, quat_to_axis_angle)
 
 DEFAULT_OBS_KEY_MAP = {
     # robot
@@ -31,6 +33,36 @@ DEFAULT_OBS_KEY_MAP = {
     'step_idx': 'step_idx',
     'timestamp': 'timestamp'
 }
+
+
+@contextlib.contextmanager
+def _open_front_realsense_depth(serial, resolution):
+    """Persistent front-D455 hardware-depth stream for the point-cloud obs path.
+
+    Twin of ``debug_pointcloud._open_realsense_stream``: keeps one ``SingleRealsense`` open and
+    yields ``grab() -> (color RGB, depth, K, units/m)``. Used only when ``setup_pointcloud`` is
+    called with ``depth_source='realsense'`` (the FFS path uses ``open_stereo_stream`` instead).
+    Owns its own SharedMemoryManager so it never collides with the env's MultiRealsense.
+    """
+    shm = SharedMemoryManager(); shm.start()
+    cam = SingleRealsense(shm, serial, resolution=tuple(resolution),
+                          enable_color=True, enable_depth=True)
+    cam.start(wait=True); cam.start_wait()
+    try:
+        for _ in range(30):  # let auto-exposure settle before the first grab
+            cam.get()
+        K = cam.get_intrinsics()
+        units_per_m = 1.0 / cam.get_depth_scale()
+
+        def grab():
+            out = cam.get()
+            color = out["color"][..., ::-1].copy()  # BGR->RGB
+            return color, out["depth"], K, units_per_m
+
+        yield grab
+    finally:
+        cam.stop(wait=True); shm.shutdown()
+
 
 class RealEnv:
     def __init__(self, 
@@ -229,6 +261,12 @@ class RealEnv:
         rolling_action_buffer = self.action_buffer = deque(maxlen=self.n_obs_steps) if rolling_action_buffer else None
 
         self.start_time = None
+
+        # Point-cloud obs pipeline (front D455 stereo/FFS + SAM2 streaming). Set up lazily by
+        # ``setup_pointcloud`` and torn down in ``stop``; ``None`` until then so plain RGB/depth
+        # eval is unaffected. See ``get_obs_pc`` / debug_pointcloud.py for the same pipeline.
+        self._pc_stack = None
+        self._pc = None
     
     # ======== start-stop API =============
     @property
@@ -245,6 +283,10 @@ class RealEnv:
 
     def stop(self, wait=True):
         self.end_episode()
+        if self._pc_stack is not None:
+            self._pc_stack.close()  # close front stereo/FFS stream + SAM2 worker
+            self._pc_stack = None
+            self._pc = None
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.stop(wait=False)
         self.robot.stop(wait=False)
@@ -369,8 +411,170 @@ class RealEnv:
         obs_data.update(last_actions)
         obs_data['timestamp'] = obs_align_timestamps
         return obs_data
-    
-    def exec_actions(self, 
+
+    # ========= point-cloud obs API ===========
+    def setup_pointcloud(self,
+            front_serial,
+            extrinsic,
+            depth_source='ffs',
+            resolution=(1280, 720),
+            sam2_ckpt='orbbec/weights/sam2/sam2.1_hiera_base_plus.pt',
+            sam2_cfg='configs/sam2.1/sam2.1_hiera_b+.yaml',
+            erode=3,
+            crop_lo=None, crop_hi=None,
+            budget=None,
+            prompts=None,
+            ffs_mock=False,
+            device=None):
+        """Stand up the front-camera point-cloud pipeline used by ``get_obs_pc``.
+
+        Mirrors ``debug_pointcloud.py --video``: opens a persistent front-D455 stream
+        (stereo->FFS metric depth, or hardware depth), starts the SAM2 streaming segmenter, and
+        seeds it ONCE on the first frame (interactive click-prompts unless ``prompts`` is given).
+        Thereafter ``get_obs_pc`` tracks + rebuilds the EE-frame segmented cloud per call.
+
+        The front camera is owned by THIS pipeline, not the env's MultiRealsense -- keep the
+        front serial out of ``camera_serial_numbers`` so the device isn't opened twice.
+
+        Args:
+            front_serial: serial of the front D455 (stereo IR + color).
+            extrinsic: (4,4) camera->base array, or a path to a .npy.
+            depth_source: 'ffs' (stereo + Fast-FoundationStereo) or 'realsense' (hardware depth).
+            resolution: capture (w, h).
+            sam2_ckpt/sam2_cfg: SAM2 streaming-fork weights/config.
+            erode: per-class mask erosion (px) before stamping the label map.
+            crop_lo/crop_hi: optional EE-frame AABB (metres) applied in build_cloud.
+            budget: per-class point budget (defaults to pointcloud_builder.DEFAULT_BUDGET).
+            prompts: {class -> (pos, neg)} clicks; None opens one matplotlib window per class.
+            ffs_mock: ramp depth for plumbing tests without FFS weights.
+            device: torch device for the on-GPU cloud build (defaults to the SAM2 device).
+        """
+        from diffusion_policy.real_world.pointcloud_segmenter import (
+            StreamingSegmenter, pick_prompts_interactive)
+
+        T_cam_base = np.load(extrinsic) if isinstance(extrinsic, str) else np.asarray(extrinsic)
+        stack = contextlib.ExitStack()
+
+        if depth_source == 'ffs':
+            from diffusion_policy.real_world.realsense_stereo import open_stereo_stream
+            from diffusion_policy.real_world.ffs_depth_client import FFSDepthClient
+            grab_stereo = stack.enter_context(
+                open_stereo_stream(front_serial, tuple(resolution), want_color=True))
+            ffs = stack.enter_context(FFSDepthClient(mock=ffs_mock))
+
+            def grab():
+                f = grab_stereo()
+                ffs.submit(f.left, f.right, f.K_ir, f.baseline_m)  # depth runs while we track
+                warp = {"K_ir": f.K_ir, "K_color": f.K_color, "T_ir_color": f.T_ir_color}
+                return f.color, f.K_ir, 1.0, warp  # depth already metric -> units/m = 1
+
+            def collect_depth():
+                return ffs.collect()
+        elif depth_source == 'realsense':
+            grab_rs = stack.enter_context(_open_front_realsense_depth(front_serial, resolution))
+            pending = {}
+
+            def grab():
+                color, depth, K, ups = grab_rs()  # hardware depth: synchronous
+                pending['depth'] = depth
+                return color, K, ups, None
+
+            def collect_depth():
+                return pending.pop('depth')
+        else:
+            stack.close()
+            raise ValueError(f"depth_source must be 'ffs' or 'realsense', got {depth_source!r}")
+
+        try:
+            color, K, depth_scale, warp = grab()
+            if prompts is None:
+                prompts = pick_prompts_interactive(color)
+            if not prompts:
+                raise RuntimeError("setup_pointcloud: no SAM2 prompts (need >=1 class clicked)")
+            seg = StreamingSegmenter(sam2_ckpt, sam2_cfg, device=device)
+            masks = seg.start(color, prompts)  # seed tracker on frame 0
+            _ = collect_depth()  # reap (+ discard) the frame-0 depth submitted by grab()
+        except Exception:
+            stack.close()
+            raise
+
+        self._pc_stack = stack
+        self._pc = dict(
+            grab=grab, collect_depth=collect_depth, seg=seg, device=seg.device,
+            T_cam_base=T_cam_base, erode=erode, crop_lo=crop_lo, crop_hi=crop_hi,
+            budget=budget, depth_source=depth_source,
+        )
+        print(f"[RealEnv] point-cloud pipeline up: depth_source={depth_source}, "
+              f"classes={list(prompts)}, device={seg.device}")
+
+    def get_obs_pc(self) -> dict:
+        """One segmented EE-frame point cloud + the robot state the BC PointNet needs.
+
+        Runs the same per-frame pipeline as ``debug_pointcloud.py --video`` (grab -> SAM2 track
+        -> warp/compose label map -> ``build_cloud_torch``), using the CURRENT EE pose from FK so
+        the cloud frame tracks the moving arm. ``PointNetPolicy`` is single-cloud (no n_obs
+        history), so this returns one cloud per call.
+
+        Returns a dict (parse it for ``policy.predict_from_state``):
+            point_cloud:        (num_points, 4) float32, EE frame, 4th channel = seg label.
+            arm_joint_pos:      (6,) float32 current arm joints (rad).
+            gripper_pos:        float32 normalized gripper position (0=open..1=closed).
+            end_effector_pose:  (6,) float32 [xyz, axis-angle], wrist_3_link in base frame.
+            cloud_stats:        CloudStats (per-class realized/available, AABB) for logging.
+            color, masks:       front color frame + per-class mask tensors (optional vis/video).
+            timestamp:          float wall-clock at grab.
+        """
+        assert self._pc is not None, "call setup_pointcloud() before get_obs_pc()"
+        import torch
+        from diffusion_policy.real_world import pointcloud_builder as B
+        from diffusion_policy.real_world.pointcloud_segmenter import (
+            compose_label_map_torch, warp_masks_to_depth_frame_torch)
+        pc = self._pc
+
+        # current robot state -> EE pose via calibrated FK (cloud frame must track the arm)
+        state = self.robot.get_state()
+        arm_joint_pos = np.asarray(state['ActualQ'], np.float64)[:6]
+        gripper_pos_raw = float(np.asarray(state['gripper_pos']).reshape(-1)[0]) \
+            if 'gripper_pos' in state else 0.0
+        ee_pos, ee_quat = get_ee_pose(arm_joint_pos)
+
+        # grab front frame (kicks off async FFS depth), track SAM2, then reap depth
+        ts = time.time()
+        color, K, depth_scale, warp = pc['grab']()
+        masks = pc['seg'].track(color)
+        depth = pc['collect_depth']()
+
+        with torch.inference_mode():
+            depth_t = torch.as_tensor(
+                np.ascontiguousarray(depth), device=pc['device'], dtype=torch.float32)
+            if warp is None:
+                label_map = compose_label_map_torch(
+                    masks, depth.shape, erode=pc['erode'], device=pc['device'])
+            else:
+                masks_depth = warp_masks_to_depth_frame_torch(
+                    masks, depth_t, warp['K_ir'], warp['K_color'], warp['T_ir_color'])
+                label_map = compose_label_map_torch(
+                    masks_depth, depth.shape, erode=pc['erode'], device=pc['device'])
+            cloud, stats = B.build_cloud_torch(
+                depth_t, K, pc['T_cam_base'], ee_pos, ee_quat, label_map=label_map,
+                depth_scale=depth_scale, crop_lo=pc['crop_lo'], crop_hi=pc['crop_hi'],
+                budget=pc['budget'])
+
+        # PointNetPolicy.predict does np.asarray(points) -> must be host numpy (cloud is tiny)
+        cloud_np = cloud.detach().cpu().numpy().astype(np.float32)
+        return dict(
+            point_cloud=cloud_np,
+            arm_joint_pos=arm_joint_pos.astype(np.float32),
+            gripper_pos=np.float32(gripper_pos_raw),
+            end_effector_pose=np.concatenate(
+                [ee_pos, quat_to_axis_angle(ee_quat)]).astype(np.float32),
+            cloud_stats=stats,
+            color=color,
+            masks=masks,
+            timestamp=ts,
+        )
+
+    def exec_actions(self,
             actions: np.ndarray, 
             timestamps: np.ndarray, 
             stages: Optional[np.ndarray]=None,

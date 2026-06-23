@@ -14,6 +14,9 @@ Locked to ``pnocc_xl_residual_big_ee``:
 
 from __future__ import annotations
 
+import json
+import os
+
 import numpy as np
 import torch
 
@@ -52,18 +55,48 @@ def build_proprio(arm_joint_pos: np.ndarray, gripper_pos_raw: float) -> np.ndarr
     ).astype(np.float32)
 
 
-class PointNetPolicy:
-    """Loads a BC PointNet checkpoint and maps (cloud, proprio) -> denormalized action."""
+def _looks_like_jit(path: str) -> bool:
+    """Heuristic: a JIT export from ``convert_bc_to_jit.py`` has a ``<path>.meta.json`` sidecar
+    (and is typically a ``.pt``); an eager Lightning policy is a ``.ckpt``."""
+    return os.path.exists(path + ".meta.json") or (
+        path.endswith(".pt") and not path.endswith(".ckpt"))
 
-    def __init__(self, ckpt_path: str, device: str = "cuda"):
+
+class PointNetPolicy:
+    """BC PointNet policy: (cloud, proprio) -> denormalized action.
+
+    Supports two checkpoint formats with one API:
+      * eager  -- a Lightning ``.ckpt`` via ``load_bc_pointnet``; proprio z-scoring and action
+                  de-normalization are applied here from the checkpoint's saved stats.
+      * jit    -- a traced module from ``convert_bc_to_jit.py`` whose ``forward(points, proprio)``
+                  has both normalizations BAKED IN (+ a ``<path>.meta.json`` sidecar for dims).
+
+    ``jit=None`` (default) auto-detects via the sidecar / extension; pass ``True``/``False`` to
+    force. Either way ``predict`` / ``predict_from_state`` return the denormalized env action.
+    """
+
+    def __init__(self, ckpt_path: str, device: str = "cuda", jit: bool = None):
         self.device = device
-        self.bc = load_bc_pointnet(ckpt_path, device)
-        self.model = self.bc["model"]
-        hp = self.bc["hp"]
-        self.point_dim = self.model.point_dim
-        self.num_points = hp.get("num_points")
-        self.proprio_dim = int(self.bc["proprio_mean"].shape[0])
-        self.action_dim = int(self.bc["action_mean"].shape[0])
+        self.jit = _looks_like_jit(ckpt_path) if jit is None else bool(jit)
+        if self.jit:
+            self.bc = None
+            self.model = torch.jit.load(ckpt_path, map_location=device).eval()
+            meta = {}
+            if os.path.exists(ckpt_path + ".meta.json"):
+                with open(ckpt_path + ".meta.json") as f:
+                    meta = json.load(f)
+            self.point_dim = int(meta.get("point_dim", 4))
+            self.num_points = meta.get("num_points")
+            self.proprio_dim = int(meta.get("proprio_dim", 18))
+            self.action_dim = int(meta.get("action_dim", 7))
+        else:
+            self.bc = load_bc_pointnet(ckpt_path, device)
+            self.model = self.bc["model"]
+            hp = self.bc["hp"]
+            self.point_dim = self.model.point_dim
+            self.num_points = hp.get("num_points")
+            self.proprio_dim = int(self.bc["proprio_mean"].shape[0])
+            self.action_dim = int(self.bc["action_mean"].shape[0])
 
     @torch.no_grad()
     def predict(self, points, proprio) -> np.ndarray:
@@ -71,7 +104,8 @@ class PointNetPolicy:
 
         Args:
             points:  (N, point_dim) or (B, N, point_dim) -- cloud, 4th channel = seg label.
-            proprio: (proprio_dim,) or (B, proprio_dim) -- z-scoring happens here.
+            proprio: (proprio_dim,) or (B, proprio_dim) -- raw; z-scoring is applied (eager) or
+                     baked into the traced graph (jit).
         Returns:
             (action_dim,) if a single sample was given, else (B, action_dim).
         """
@@ -85,10 +119,13 @@ class PointNetPolicy:
         assert pts.shape[-1] == self.point_dim, f"cloud channel {pts.shape[-1]} != point_dim {self.point_dim}"
         assert pr.shape[-1] == self.proprio_dim, f"proprio dim {pr.shape[-1]} != {self.proprio_dim}"
 
-        pr_n = (pr - self.bc["proprio_mean"]) / self.bc["proprio_std"]
-        out = self.model(pts, pr_n)
-        mean = out[0] if isinstance(out, tuple) else out  # predict_std -> (mean, log_std)
-        action = mean * self.bc["action_std"] + self.bc["action_mean"]
+        if self.jit:
+            action = self.model(pts, pr)  # forward bakes in proprio z-score + action denorm
+        else:
+            pr_n = (pr - self.bc["proprio_mean"]) / self.bc["proprio_std"]
+            out = self.model(pts, pr_n)
+            mean = out[0] if isinstance(out, tuple) else out  # predict_std -> (mean, log_std)
+            action = mean * self.bc["action_std"] + self.bc["action_mean"]
         action = action.cpu().numpy()
         return action[0] if squeeze else action
 
