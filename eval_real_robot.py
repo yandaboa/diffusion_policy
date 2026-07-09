@@ -139,14 +139,20 @@ def compute_calibrated_ee_pose(joint_positions):
               help='Dataset used to overlay and adjust initial condition')
 @click.option('--match_episode', '-me', default=None, type=int, 
               help='Match specific episode from the match dataset')
-@click.option('--vis_camera_idx', default=0, type=int, 
+@click.option('--vis_camera_idx', default=0, type=int,
               help="Which RealSense camera to visualize.")
+@click.option('--cameras', '-c', default='side', type=str,
+              help="Comma-separated cameras to enable, from {front, side, wrist}. "
+                   "E.g. '--cameras side,wrist'. The order given determines the obs "
+                   "key assignment in RealEnv (3 cams -> front_rgb/side_rgb/wrist_rgb, "
+                   "fewer -> side_rgb/wrist_rgb). Cameras not physically connected are "
+                   "skipped with a warning.")
 @click.option('--init_joints', '-j', is_flag=True, default=False, 
               help="Whether to initialize robot joint configuration in the "
                    "beginning.")
 @click.option('--steps_per_inference', '-si', default=1, type=int, 
               help="Action horizon for inference.")
-@click.option('--max_duration', '-md', default=20,
+@click.option('--max_duration', '-md', default=16,
               help='Max duration for each epoch in seconds.')
 @click.option('--frequency', '-f', default=10, type=float, 
               help="Control frequency in Hz.")
@@ -171,7 +177,7 @@ def compute_calibrated_ee_pose(joint_positions):
                    'the highest resolution common to D415/D435/D455 at 30fps. '
                    'Policy obs resolution is set by the checkpoint independently.')
 def main(input, output, robot_ip, match_dataset, match_episode,
-         vis_camera_idx, init_joints,
+         vis_camera_idx, cameras, init_joints,
          steps_per_inference, max_duration,
          frequency, save_video, action_noise, contact_threshold,
          collect_sysid, plot_gripper, z_terminate, input_res):
@@ -304,27 +310,38 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     # load checkpoint
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
+    # Named camera registry: name -> (serial, config path). RealEnv assigns obs
+    # keys positionally by camera count (3 -> front/side/wrist_rgb, fewer ->
+    # side/wrist_rgb), so the --cameras order also controls the obs key naming.
+    CAMERA_REGISTRY = {
+        'front': ('215122255213', 'diffusion_policy/real_world/realsense_config/455_front.json'),
+        'side':  ('832112070487', 'diffusion_policy/real_world/realsense_config/435_side.json'),
+        'wrist': ('746112060198', 'diffusion_policy/real_world/realsense_config/415_wrist.json'),
+    }
+    requested = [c.strip().lower() for c in cameras.split(',') if c.strip()]
+    unknown = [c for c in requested if c not in CAMERA_REGISTRY]
+    if unknown:
+        raise ValueError(
+            f"Unknown camera(s) {unknown}; choose from {list(CAMERA_REGISTRY)}.")
+    if not requested:
+        raise ValueError("No cameras requested; pass --cameras e.g. 'side,wrist'.")
+
     # Detect which cameras are physically connected and filter accordingly.
-    # RealEnv maps camera index 0→front_rgb, 1→side_rgb, 2→wrist_rgb, so
-    # dropping a serial from the list simply omits that key from obs.
     import pyrealsense2 as _rs
     _connected = {
         d.get_info(_rs.camera_info.serial_number)
         for d in _rs.context().devices
         if d.get_info(_rs.camera_info.name).lower() != 'platform camera'
     }
-    _all_cameras = [
-        # ('215122255213', json.load(open("diffusion_policy/real_world/realsense_config/455_front.json"))),
-        ('832112070487', json.load(open("diffusion_policy/real_world/realsense_config/435_side.json"))),
-        # ('746112060198', json.load(open("diffusion_policy/real_world/realsense_config/415_wrist.json"))),
-    ]
-    _active = [(s, c) for s, c in _all_cameras if s in _connected]
-    _missing = [s for s, _ in _all_cameras if s not in _connected]
+    _missing = [name for name in requested
+                if CAMERA_REGISTRY[name][0] not in _connected]
     if _missing:
         print(f"Warning: cameras not connected, skipping: {_missing}")
-    camera_serial_numbers = [s for s, _ in _active]
-    configs = [c for _, c in _active]
-    print(f"Active cameras: {camera_serial_numbers}")
+    _active = [name for name in requested
+               if CAMERA_REGISTRY[name][0] in _connected]
+    camera_serial_numbers = [CAMERA_REGISTRY[name][0] for name in _active]
+    configs = [json.load(open(CAMERA_REGISTRY[name][1])) for name in _active]
+    print(f"Active cameras: {list(zip(_active, camera_serial_numbers))}")
 
     ckpt_path = input
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
@@ -637,7 +654,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                                 color=(255,255,255)
                             )
                             cv2.imshow('Policy Control', vis_img[...,::-1])
-
+                        
+                        ee_z = float(obs_pos[2])  # EE height (REP-103 base frame)
 
                         key_stroke = cv2.pollKey()
                         if key_stroke == ord('g'):
@@ -673,6 +691,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             
                             # Move robot to initial position
                             env.robot.reset_to_initial_position()
+                            prompt_success_fail(episode_id, ee_z)
                             
                             # Wait a moment for robot to settle
                             time.sleep(5.0)
@@ -693,7 +712,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
                         # auto termination
                         terminate = False
-                        ee_z = float(obs_pos[2])  # EE height (REP-103 base frame)
                         if ee_z > z_terminate:
                             terminate = True
                             print(f'Terminated: EE z={ee_z:.3f} > {z_terminate:.3f}')
@@ -722,6 +740,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             save_sysid_data()
                             save_gripper_plot()
                             env.end_episode()
+                            obs_history.clear()
                             if save_video and episode_video_writer is not None:
                                 episode_video_writer.close()
                                 episode_video_writer = None

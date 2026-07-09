@@ -64,8 +64,43 @@ def _open_front_realsense_depth(serial, resolution):
         cam.stop(wait=True); shm.shutdown()
 
 
+@contextlib.contextmanager
+def _open_front_orbbec(serial, resolution):
+    """Persistent front-Orbbec (Femto Bolt) stream for the point-cloud obs path.
+
+    Orbbec twin of ``_open_front_realsense_depth``. Opens color + depth, software-aligns depth
+    onto the color grid (no HW D2C on the Femto), and yields
+    ``grab() -> (color RGB HxWx3, xyz_m HxWx3, rgb HxWx3, K_color)``.
+
+    The points come straight from Orbbec's ``PointCloudFilter`` -- a dense grid row-major over the
+    color frame, already in the COLOR optical frame -- so they line up 1:1 with the SAM2 masks
+    (which run on that same color image) and need NO IR->color warp. Positions are converted mm->m.
+    Only one Orbbec is supported (``open_camera`` opens the first device); ``serial`` is advisory.
+    """
+    from orbbec.orbbec_camera import (
+        open_camera, warmup_autoexposure, capture_aligned, color_intrinsics,
+        make_pointcloud_filter, orbbec_pointcloud)
+    w, h = tuple(resolution)
+    pipe, align = open_camera(serial, w, h, 30)
+    try:
+        warmup_autoexposure(pipe, align)
+        K, cam = color_intrinsics(pipe)
+        pcf = make_pointcloud_filter(cam)
+
+        def grab():
+            color, fs = capture_aligned(pipe, align)
+            grid = orbbec_pointcloud(pcf, fs)            # (H,W,6) xyz(mm) + rgb
+            xyz_m = (grid[..., :3] / 1000.0).astype(np.float32)   # mm -> m, color frame
+            rgb = grid[..., 3:6].astype(np.uint8)
+            return color, xyz_m, rgb, K
+
+        yield grab
+    finally:
+        pipe.stop()
+
+
 class RealEnv:
-    def __init__(self, 
+    def __init__(self,
             # required params
             output_dir,
             robot_ip,
@@ -204,18 +239,19 @@ class RealEnv:
 
         cube_diag = np.linalg.norm([1,1,1])
 
-        custom_init_joints = np.array([0.020015, -1.39426, 2.13054, -2.246, -1.618852138519287, -0.087])
-        
+        # Fallback home pose (radians) used only when the caller doesn't pass custom_init_joints.
+        default_init_joints = np.array([0.020015, -1.39426, 2.13054, -2.246, -1.618852138519287, -0.087])
+
         # Handle joint initialization
         j_init = None
         if init_joints:
             if custom_init_joints is not None:
-                # Use custom initial joint positions if provided
+                # Use caller-provided joint positions (e.g. the sim joint pose).
                 j_init = np.array(custom_init_joints)
                 print(f"Using custom initial joint positions: {j_init}")
             else:
-                # Use default initial joint positions
-                j_init = np.array([16.85, -79.74, 99.80, -114.68, -91.09, 20.43]) / 180 * np.pi
+                # Fall back to the hardcoded default home pose.
+                j_init = default_init_joints
                 print(f"Using default initial joint positions: {j_init}")
 
         robot = RTDEInterpolationController(
@@ -424,7 +460,9 @@ class RealEnv:
             crop_lo=None, crop_hi=None,
             budget=None,
             prompts=None,
+            prompt_classes=None,
             ffs_mock=False,
+            segment=True,
             device=None):
         """Stand up the front-camera point-cloud pipeline used by ``get_obs_pc``.
 
@@ -446,14 +484,27 @@ class RealEnv:
             crop_lo/crop_hi: optional EE-frame AABB (metres) applied in build_cloud.
             budget: per-class point budget (defaults to pointcloud_builder.DEFAULT_BUDGET).
             prompts: {class -> (pos, neg)} clicks; None opens one matplotlib window per class.
+            prompt_classes: which classes to interactively prompt when ``prompts`` is None (one
+                SAM2-tracked window each). Defaults to robot/peg/hole; pass e.g. ('peg', 'hole')
+                to skip the robot (peg/hole-only policies). Ignored when ``prompts`` is given.
             ffs_mock: ramp depth for plumbing tests without FFS weights.
-            device: torch device for the on-GPU cloud build (defaults to the SAM2 device).
+            segment: run SAM2 (interactive prompts + streaming tracker). True for the policy obs
+                path. Set False to skip segmentation entirely -- no SAM2 load, no click prompts --
+                so ``grab_segmented_cloud_camera_frame`` returns the FULL raw cloud (every valid
+                point, label NaN). Used by the perception-gap probe. ``get_obs_pc`` requires True.
+            device: torch device for the on-GPU cloud build (defaults to the SAM2 device, or
+                cuda/cpu autodetect when ``segment`` is False).
         """
         from diffusion_policy.real_world.pointcloud_segmenter import (
             StreamingSegmenter, pick_prompts_interactive)
 
         T_cam_base = np.load(extrinsic) if isinstance(extrinsic, str) else np.asarray(extrinsic)
         stack = contextlib.ExitStack()
+
+        # ``direct_points``: the depth source emits camera-frame XYZ directly (Orbbec
+        # PointCloudFilter) instead of a depth image we backproject. ``collect_depth`` then
+        # returns ``(xyz_m_grid, rgb_grid)`` rather than a depth array. See get_obs_pc.
+        direct_points = False
 
         if depth_source == 'ffs':
             from diffusion_policy.real_world.realsense_stereo import open_stereo_stream
@@ -481,18 +532,42 @@ class RealEnv:
 
             def collect_depth():
                 return pending.pop('depth')
+        elif depth_source == 'orbbec':
+            grab_ob = stack.enter_context(_open_front_orbbec(front_serial, resolution))
+            pending = {}
+
+            def grab():
+                color, xyz_m, rgb, K = grab_ob()
+                pending['xyz'] = xyz_m
+                pending['rgb'] = rgb
+                # color frame -> warp None (masks compose directly); depth_scale unused for
+                # direct points (XYZ already metric), but kept in the tuple for interface parity.
+                return color, K, 1.0, None
+
+            def collect_depth():
+                return pending.pop('xyz'), pending.pop('rgb')  # (H,W,3) m, (H,W,3) rgb
+            direct_points = True
         else:
             stack.close()
-            raise ValueError(f"depth_source must be 'ffs' or 'realsense', got {depth_source!r}")
+            raise ValueError(
+                f"depth_source must be 'ffs', 'realsense' or 'orbbec', got {depth_source!r}")
 
         try:
             color, K, depth_scale, warp = grab()
-            if prompts is None:
-                prompts = pick_prompts_interactive(color)
-            if not prompts:
-                raise RuntimeError("setup_pointcloud: no SAM2 prompts (need >=1 class clicked)")
-            seg = StreamingSegmenter(sam2_ckpt, sam2_cfg, device=device)
-            masks = seg.start(color, prompts)  # seed tracker on frame 0
+            if segment:
+                if prompts is None:
+                    prompts = pick_prompts_interactive(color) if prompt_classes is None \
+                        else pick_prompts_interactive(color, class_names=tuple(prompt_classes))
+                if not prompts:
+                    raise RuntimeError("setup_pointcloud: no SAM2 prompts (need >=1 class clicked)")
+                seg = StreamingSegmenter(sam2_ckpt, sam2_cfg, device=device)
+                seg.start(color, prompts)  # seed tracker on frame 0
+                dev = seg.device
+            else:
+                # Full-cloud / perception-gap mode: no SAM2, no prompts.
+                seg = None
+                import torch
+                dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
             _ = collect_depth()  # reap (+ discard) the frame-0 depth submitted by grab()
         except Exception:
             stack.close()
@@ -500,12 +575,12 @@ class RealEnv:
 
         self._pc_stack = stack
         self._pc = dict(
-            grab=grab, collect_depth=collect_depth, seg=seg, device=seg.device,
+            grab=grab, collect_depth=collect_depth, seg=seg, device=dev,
             T_cam_base=T_cam_base, erode=erode, crop_lo=crop_lo, crop_hi=crop_hi,
-            budget=budget, depth_source=depth_source,
+            budget=budget, depth_source=depth_source, direct_points=direct_points,
         )
         print(f"[RealEnv] point-cloud pipeline up: depth_source={depth_source}, "
-              f"classes={list(prompts)}, device={seg.device}")
+              f"segment={segment}, classes={list(prompts) if segment else '[]'}, device={dev}")
 
     def get_obs_pc(self) -> dict:
         """One segmented EE-frame point cloud + the robot state the BC PointNet needs.
@@ -525,6 +600,8 @@ class RealEnv:
             timestamp:          float wall-clock at grab.
         """
         assert self._pc is not None, "call setup_pointcloud() before get_obs_pc()"
+        assert self._pc['seg'] is not None, \
+            "get_obs_pc needs the SAM2 segmenter; call setup_pointcloud(segment=True)"
         import torch
         from diffusion_policy.real_world import pointcloud_builder as B
         from diffusion_policy.real_world.pointcloud_segmenter import (
@@ -538,45 +615,182 @@ class RealEnv:
             if 'gripper_pos' in state else 0.0
         ee_pos, ee_quat = get_ee_pose(arm_joint_pos)
 
-        # grab front frame (kicks off async FFS depth), track SAM2, then reap depth
+        # grab front frame (kicks off async FFS depth), track SAM2, then reap depth/points
         ts = time.time()
         color, K, depth_scale, warp = pc['grab']()
         masks = pc['seg'].track(color)
-        depth = pc['collect_depth']()
+        payload = pc['collect_depth']()
 
         with torch.inference_mode():
-            depth_t = torch.as_tensor(
-                np.ascontiguousarray(depth), device=pc['device'], dtype=torch.float32)
-            if warp is None:
+            if pc['direct_points']:
+                # Orbbec: camera-frame XYZ straight from PointCloudFilter (color frame, no warp).
+                xyz_m, _rgb = payload
+                H, W = xyz_m.shape[:2]
                 label_map = compose_label_map_torch(
-                    masks, depth.shape, erode=pc['erode'], device=pc['device'])
+                    masks, (H, W), erode=pc['erode'], device=pc['device'])
+                pts = torch.as_tensor(
+                    np.ascontiguousarray(xyz_m).reshape(-1, 3),
+                    device=pc['device'], dtype=torch.float32)
+                valid = torch.isfinite(pts[:, 2]) & (pts[:, 2] > 0)  # Orbbec: invalid depth -> z=0
+                cloud, stats = B.assemble_cloud_torch(
+                    pts[valid], label_map.reshape(-1)[valid], pc['T_cam_base'], ee_pos, ee_quat,
+                    label_mode=True, crop_lo=pc['crop_lo'], crop_hi=pc['crop_hi'],
+                    budget=pc['budget'])
+                # metric color-aligned depth (m) for the eval's depth-coverage overlay
+                depth = pts[:, 2].reshape(H, W).detach().cpu().numpy()
             else:
-                masks_depth = warp_masks_to_depth_frame_torch(
-                    masks, depth_t, warp['K_ir'], warp['K_color'], warp['T_ir_color'])
-                label_map = compose_label_map_torch(
-                    masks_depth, depth.shape, erode=pc['erode'], device=pc['device'])
-            cloud, stats = B.build_cloud_torch(
-                depth_t, K, pc['T_cam_base'], ee_pos, ee_quat, label_map=label_map,
-                depth_scale=depth_scale, crop_lo=pc['crop_lo'], crop_hi=pc['crop_hi'],
-                budget=pc['budget'])
+                depth = payload
+                depth_t = torch.as_tensor(
+                    np.ascontiguousarray(depth), device=pc['device'], dtype=torch.float32)
+                if warp is None:
+                    label_map = compose_label_map_torch(
+                        masks, depth.shape, erode=pc['erode'], device=pc['device'])
+                else:
+                    masks_depth = warp_masks_to_depth_frame_torch(
+                        masks, depth_t, warp['K_ir'], warp['K_color'], warp['T_ir_color'])
+                    label_map = compose_label_map_torch(
+                        masks_depth, depth.shape, erode=pc['erode'], device=pc['device'])
+                cloud, stats = B.build_cloud_torch(
+                    depth_t, K, pc['T_cam_base'], ee_pos, ee_quat, label_map=label_map,
+                    depth_scale=depth_scale, crop_lo=pc['crop_lo'], crop_hi=pc['crop_hi'],
+                    budget=pc['budget'])
 
         # PointNetPolicy.predict does np.asarray(points) -> must be host numpy (cloud is tiny)
         cloud_np = cloud.detach().cpu().numpy().astype(np.float32)
+        ee_pose_vec = np.concatenate(
+            [ee_pos, quat_to_axis_angle(ee_quat)]).astype(np.float32)
+
+        # Accumulate into the recording buffer (mirrors what get_obs does for the RGB eval).
+        # get_obs_pc -- NOT get_obs -- is the obs path for the point-cloud eval, so without this
+        # the obs_accumulator stays empty and end_episode's min(len(obs), len(action)) collapses
+        # to 0, silently dropping the whole episode (no clouds, no actions). One sample per call,
+        # keyed by the grab timestamp; the segmented cloud is saved so it can be replayed/visualized.
+        if self.obs_accumulator is not None:
+            self.obs_accumulator.put(
+                {
+                    'point_cloud': cloud_np[None],
+                    'arm_joint_pos': arm_joint_pos.astype(np.float32)[None],
+                    'gripper_pos': np.asarray([gripper_pos_raw], np.float32),
+                    'end_effector_pose': ee_pose_vec[None],
+                },
+                np.array([ts]),
+            )
         return dict(
             point_cloud=cloud_np,
             arm_joint_pos=arm_joint_pos.astype(np.float32),
             gripper_pos=np.float32(gripper_pos_raw),
-            end_effector_pose=np.concatenate(
-                [ee_pos, quat_to_axis_angle(ee_quat)]).astype(np.float32),
+            end_effector_pose=ee_pose_vec,
             cloud_stats=stats,
             color=color,
             masks=masks,
+            depth=depth,             # raw depth map (FFS: left-IR frame, metres; RS: color-aligned)
+            depth_scale=depth_scale, # depth units per metre (FFS: 1.0, RS: ~1000)
+            K=K,                     # depth-frame intrinsics (K_ir for FFS)
+            warp=warp,               # None for RS (depth==color frame); IR->color dict for FFS
             timestamp=ts,
         )
 
+    def grab_segmented_cloud_camera_frame(self):
+        """One full-resolution segmented point cloud in the CAMERA frame, no downsampling.
+
+        Perception/quality probe (see ``eval_real_robot_pc.py --perception_test``). Runs the
+        SAME grab -> SAM2 track -> warp/compose-label-map pipeline as ``get_obs_pc``, but stops
+        at the camera frame and keeps EVERY valid-depth point: no base/EE transform, no crop, no
+        per-class budget sampling. Background pixels keep label ``NaN`` so the full scene cloud is
+        preserved alongside the segmentation -- meant for sim-vs-real perception-gap comparison.
+
+        The points are in the same camera frame the build pipeline uses (FFS: left-IR frame;
+        RealSense: color-aligned frame; Orbbec: color optical frame from PointCloudFilter) -- i.e.
+        the frame ``T_cam_base`` maps to base -- so they line up with the sim camera once the same
+        extrinsic is applied. NOTE the extrinsic must match the chosen camera (the Orbbec color
+        frame and the D455 IR frame are different physical optical frames).
+
+        Returns a dict:
+            points:      (M, 3) float32 camera-frame xyz (metres); M = every valid-depth point.
+            labels:      (M,) float32 seg label per point (SEG_LABELS values; NaN = background).
+            colors:      (M, 3) uint8 per-point RGB when available (RealSense color-aligned depth,
+                         or Orbbec's RGB point cloud), else None (FFS: cloud is in the IR frame).
+            color:       (H, W, 3) uint8 front color frame (RGB).
+            masks:       per-class SAM2 mask tensors.
+            depth:       depth map / z-grid (FFS: IR frame, m; RS: color-aligned; Orbbec: color z, m).
+            depth_scale: depth units per metre.
+            K:           color/depth-frame intrinsics.
+            warp:        None for RS/Orbbec (cloud in color frame); IR->color dict for FFS.
+            timestamp:   wall-clock at grab.
+        """
+        assert self._pc is not None, \
+            "call setup_pointcloud() before grab_segmented_cloud_camera_frame()"
+        import torch
+        from diffusion_policy.real_world import pointcloud_builder as B
+        from diffusion_policy.real_world.pointcloud_segmenter import (
+            compose_label_map_torch, warp_masks_to_depth_frame_torch)
+        pc = self._pc
+
+        # grab front frame (kicks off async FFS depth), track SAM2 (if segmenting), reap depth/points
+        ts = time.time()
+        color, K, depth_scale, warp = pc['grab']()
+        masks = pc['seg'].track(color) if pc['seg'] is not None else None
+        payload = pc['collect_depth']()
+
+        if pc['direct_points']:
+            # Orbbec: camera-frame XYZ + per-point RGB straight from PointCloudFilter (color frame).
+            xyz_m, rgb_grid = payload
+            H, W = xyz_m.shape[:2]
+            z = xyz_m[..., 2].reshape(-1)
+            valid = np.isfinite(z) & (z > 0)  # Orbbec marks invalid depth with z=0
+            points_np = xyz_m.reshape(-1, 3)[valid].astype(np.float32)
+            colors_np = rgb_grid.reshape(-1, 3)[valid].astype(np.uint8)
+            if masks is not None:
+                with torch.inference_mode():
+                    label_map = compose_label_map_torch(
+                        masks, (H, W), erode=pc['erode'], device=pc['device'])
+                    labels_all = label_map.reshape(-1).detach().cpu().numpy().astype(np.float32)
+                labels_np = labels_all[valid]
+            else:  # full-cloud mode: every valid point, no labels
+                labels_np = np.full(points_np.shape[0], np.nan, np.float32)
+            depth = xyz_m[..., 2].astype(np.float32)  # color-aligned metric z for the vis overlay
+        else:
+            with torch.inference_mode():
+                depth = payload
+                depth_t = torch.as_tensor(
+                    np.ascontiguousarray(depth), device=pc['device'], dtype=torch.float32)
+                # backproject to the CAMERA frame; keep every valid-depth pixel (NO base/EE
+                # transform, NO crop, NO per-class budget -- this is the un-touched cloud).
+                pts_cam, pix_idx = B.backproject_torch(depth_t, K, depth_scale)
+                if masks is None:  # full-cloud mode: no segmentation
+                    labels = torch.full((pix_idx.numel(),), float('nan'),
+                                        dtype=torch.float32, device=pts_cam.device)
+                else:
+                    if warp is None:
+                        label_map = compose_label_map_torch(
+                            masks, depth.shape, erode=pc['erode'], device=pc['device'])
+                    else:
+                        masks_depth = warp_masks_to_depth_frame_torch(
+                            masks, depth_t, warp['K_ir'], warp['K_color'], warp['T_ir_color'])
+                        label_map = compose_label_map_torch(
+                            masks_depth, depth.shape, erode=pc['erode'], device=pc['device'])
+                    labels = label_map.reshape(-1)[pix_idx]  # SEG_LABELS value, or NaN for background
+
+            points_np = pts_cam.detach().cpu().numpy().astype(np.float32)
+            labels_np = labels.detach().cpu().numpy().astype(np.float32)
+            pix_idx_np = pix_idx.detach().cpu().numpy()
+
+            # Per-point color only when depth is color-aligned (RealSense): then pix_idx indexes
+            # the color image directly. For FFS the cloud lives in the IR frame, so the color image
+            # does NOT index by pix_idx -> leave colors None (full color frame returned for vis).
+            colors_np = None
+            if warp is None and color is not None and color.shape[:2] == tuple(depth.shape[:2]):
+                colors_np = color.reshape(-1, 3)[pix_idx_np].astype(np.uint8)
+
+        return dict(
+            points=points_np, labels=labels_np, colors=colors_np,
+            color=color, masks=masks, depth=depth, depth_scale=depth_scale,
+            K=np.asarray(K), warp=warp, timestamp=ts,
+        )
+
     def exec_actions(self,
-            actions: np.ndarray, 
-            timestamps: np.ndarray, 
+            actions: np.ndarray,
+            timestamps: np.ndarray,
             stages: Optional[np.ndarray]=None,
             obs_actions: Optional[np.ndarray]=None):
         """

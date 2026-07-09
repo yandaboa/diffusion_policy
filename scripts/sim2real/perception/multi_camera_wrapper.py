@@ -58,6 +58,18 @@ class MultiCameraWrapper:
                     align=self.align,
                 )
             )
+        elif self.type == "orbbec":
+            from perception.orbbec import gather_orbbec_cameras
+
+            self._all_cameras.extend(
+                gather_orbbec_cameras(
+                    rgb=self.rgb,
+                    depth=self.depth,
+                    ir=self.ir,
+                    high_res_rgb=self.high_res_rgb,
+                    align=self.align,
+                )
+            )
         # elif self.type == "zed":
         #     from perception.zed_camera import gather_zed_cameras
         #     self._all_cameras.extend(gather_zed_cameras())

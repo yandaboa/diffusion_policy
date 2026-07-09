@@ -149,7 +149,7 @@ class RTDEInterpolationController(mp.Process):
 
     def stop(self, wait=True):
         message = {
-            'cmd': np.array([Command.STOP.value], dtype=np.int32),
+            'cmd': Command.STOP.value,
             'target_joints': np.zeros((6,), dtype=np.float64),
             'target_ee_pos': np.zeros((3,), dtype=np.float64),
             'target_ee_quat': np.zeros((4,), dtype=np.float64),
@@ -193,7 +193,7 @@ class RTDEInterpolationController(mp.Process):
         assert target_joints.shape == (6,)
 
         message = {
-            'cmd': np.array([Command.JointTorqueControl.value], dtype=np.int32),
+            'cmd': Command.JointTorqueControl.value,
             'target_joints': target_joints.astype(np.float64),
             'target_ee_pos': np.zeros((3,), dtype=np.float64),
             'target_ee_quat': np.zeros((4,), dtype=np.float64),
@@ -217,7 +217,7 @@ class RTDEInterpolationController(mp.Process):
         assert target_quat.shape == (4,)
 
         message = {
-            'cmd': np.array([Command.CartesianOSCControl.value], dtype=np.int32),
+            'cmd': Command.CartesianOSCControl.value,
             'target_joints': np.zeros((6,), dtype=np.float64),
             'target_ee_pos': target_pos,
             'target_ee_quat': target_quat,
@@ -367,11 +367,11 @@ class RTDEInterpolationController(mp.Process):
                 # update gripper state
                 if (current_gripper_close and
                         current_gripper_state == 'open'):
-                    gripper.move(gripper.get_closed_position(), 128, 128)
+                    gripper.move(gripper.get_closed_position(), 200, 128)
                     current_gripper_state = 'closed'
                 elif (not current_gripper_close and
                       current_gripper_state == 'closed'):
-                    gripper.move(gripper.get_open_position(), 128, 128)
+                    gripper.move(gripper.get_open_position(), 200, 128)
                     current_gripper_state = 'open'
 
                 # update robot state

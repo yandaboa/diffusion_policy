@@ -101,6 +101,11 @@ def budget_sample(points: np.ndarray, labels: np.ndarray, budget: dict,
         available[label] = int(sel.size)
         if sel.size == 0:
             short.append(label)
+            # Fully occluded class: emit its full budget as zero points (xyz=0, class label kept)
+            # so the cloud stays a fixed size (sum(budget)) with the same per-class proportions,
+            # instead of returning a smaller cloud the policy/accumulator can't ingest.
+            out_pts.append(np.zeros((target, 3), np.float32))
+            out_lab.append(np.full(target, label, np.float32))
             continue
         if sel.size >= target:
             pick = rng.choice(sel, size=target, replace=False)
@@ -234,6 +239,11 @@ def budget_sample_torch(points, labels, budget: dict, pad: str = "repeat", gener
         available[label] = n
         if n == 0:
             short.append(label)
+            # Fully occluded class: emit its full budget as zero points (xyz=0, class label kept)
+            # so the cloud stays a fixed size (sum(budget)) with the same per-class proportions,
+            # instead of returning a smaller cloud the policy/accumulator can't ingest.
+            out_pts.append(torch.zeros((target, 3), dtype=torch.float32, device=dev))
+            out_lab.append(torch.full((target,), float(label), dtype=torch.float32, device=dev))
             continue
         if n >= target:
             pick = sel[torch.randperm(n, device=dev, generator=generator)[:target]]
@@ -250,31 +260,33 @@ def budget_sample_torch(points, labels, budget: dict, pad: str = "repeat", gener
     return coords.to(torch.float32), labs, available, short
 
 
-def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
-                      depth_scale: float = 1000.0, crop_lo=None, crop_hi=None,
-                      budget: Optional[dict] = None, pad: str = "repeat", generator=None):
-    """On-device twin of ``build_cloud``: depth tensor (+ label_map tensor) -> (cloud (N,4)
-    float32 tensor, CloudStats). bbox stats are pulled to host (small); the cloud stays on-device."""
+def assemble_cloud_torch(pts_cam, labels, T_cam_base, ee_pos, ee_quat_wxyz, label_mode=True,
+                         crop_lo=None, crop_hi=None, budget: Optional[dict] = None,
+                         pad: str = "repeat", generator=None):
+    """Shared tail of the on-device cloud build: camera-frame points (+ per-point labels) ->
+    base -> EE frame -> crop -> per-class budget -> (cloud (N,4), CloudStats).
+
+    Factored out so both the depth-backprojection path (``build_cloud_torch``) and a sensor that
+    emits points directly (e.g. Orbbec's ``PointCloudFilter``) feed the SAME transform/crop/budget
+    logic. ``pts_cam`` is (M,3) in the camera optical frame; ``labels`` is (M,) with SEG_LABELS
+    values and ``NaN`` for background. ``label_mode=False`` keeps every point with label 0.0 and
+    skips budgeting (geometry-only debug)."""
     import torch
     stats = CloudStats()
-    pts_cam, pix_idx = backproject_torch(depth, K, depth_scale)
-    stats.n_raw_valid = int(pix_idx.numel())
+    stats.n_raw_valid = int(pts_cam.shape[0])
 
     pts_base = transform_points_torch(pts_cam, T_cam_base)
     pts_ee = to_ee_frame_torch(pts_base, ee_pos, ee_quat_wxyz)
 
-    if label_map is not None:
-        labels = label_map.reshape(-1)[pix_idx]
-        keep = torch.isfinite(labels)  # drop background pixels
+    if label_mode:
+        keep = torch.isfinite(labels)  # drop background points
         pts_ee, labels = pts_ee[keep], labels[keep]
-    else:
-        labels = torch.zeros(pts_ee.shape[0], dtype=torch.float32, device=pts_ee.device)
 
     if crop_lo is not None and crop_hi is not None:
         pts_ee, labels = crop_aabb_torch(pts_ee, crop_lo, crop_hi, labels)
     stats.n_after_crop = int(pts_ee.shape[0])
 
-    if label_map is None:
+    if not label_mode:
         coords, labs = pts_ee.to(torch.float32), labels
         stats.per_class_available = {0.0: int(coords.shape[0])}
         stats.per_class_realized = {0.0: int(coords.shape[0])}
@@ -290,3 +302,19 @@ def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None
         stats.bbox_max = coords.max(0).values.detach().cpu().numpy()
     cloud = torch.cat([coords, labs[:, None]], dim=1).to(torch.float32)
     return cloud, stats
+
+
+def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
+                      depth_scale: float = 1000.0, crop_lo=None, crop_hi=None,
+                      budget: Optional[dict] = None, pad: str = "repeat", generator=None):
+    """On-device twin of ``build_cloud``: depth tensor (+ label_map tensor) -> (cloud (N,4)
+    float32 tensor, CloudStats). bbox stats are pulled to host (small); the cloud stays on-device."""
+    import torch
+    pts_cam, pix_idx = backproject_torch(depth, K, depth_scale)
+    if label_map is not None:
+        labels = label_map.reshape(-1)[pix_idx]
+    else:
+        labels = torch.zeros(pts_cam.shape[0], dtype=torch.float32, device=pts_cam.device)
+    return assemble_cloud_torch(
+        pts_cam, labels, T_cam_base, ee_pos, ee_quat_wxyz, label_mode=(label_map is not None),
+        crop_lo=crop_lo, crop_hi=crop_hi, budget=budget, pad=pad, generator=generator)

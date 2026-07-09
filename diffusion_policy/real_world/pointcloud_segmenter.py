@@ -296,6 +296,13 @@ def pick_prompts_interactive(rgb: np.ndarray, class_names=("robot", "peg", "hole
     Returns {class_name -> (pos, neg)} for use with ``label_map``. Close each window to
     advance to the next class; a class with no positive clicks is treated as absent.
     """
+    # Force a non-Qt interactive backend: matplotlib's default QtAgg pulls in PyQt5, which
+    # loads conda's libQt5Core into the process and breaks cv2.imshow's bundled xcb plugin
+    # ("could not load Qt platform plugin xcb"). Tk has no Qt dependency, so Qt stays cv2's alone.
+    import os
+    import matplotlib
+    if "matplotlib.pyplot" not in __import__("sys").modules:
+        matplotlib.use(os.environ.get("MPLBACKEND", "TkAgg"), force=True)
     import matplotlib.pyplot as plt
     prompts = {}
     for name in class_names:

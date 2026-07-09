@@ -8,7 +8,9 @@ reconstruction from real-robot scalars.
 Locked to ``pnocc_xl_residual_big_ee``:
   * cloud   : (num_points, 4) = xyz + seg label {robot:0, peg:-1, hole:+1}, in EE frame
   * proprio : 18-d = [joint_pos(12: 6 arm + 6 Robotiq mimic, rad), ee_pose(6: xyz +
-              axis-angle, wrist_3_link in BASE frame)]  -- declaration order, NO prev_actions
+              axis-angle, wrist_3_link in BASE frame)]  -- declaration order, NO prev_actions.
+              ``*_no_gripper`` checkpoints use 12-d = [arm_joint_pos(6), ee_pose(6)] (the 6
+              mimic gripper joints dropped); selected by the checkpoint's proprio_dim.
   * action  : 7-d = RelCartesian OSC dpose(6) + binary gripper(1), denormalized
 """
 
@@ -48,11 +50,17 @@ def build_ee_pose(arm_joint_pos: np.ndarray) -> np.ndarray:
     return np.concatenate([pos, quat_to_axis_angle(quat)]).astype(np.float32)
 
 
-def build_proprio(arm_joint_pos: np.ndarray, gripper_pos_raw: float) -> np.ndarray:
-    """Assemble the 18-d proprio vector in the trained declaration order."""
-    return np.concatenate(
-        [build_joint_pos(arm_joint_pos, gripper_pos_raw), build_ee_pose(arm_joint_pos)]
-    ).astype(np.float32)
+def build_proprio(arm_joint_pos: np.ndarray, gripper_pos_raw: float,
+                  include_gripper_joints: bool = True) -> np.ndarray:
+    """Assemble the proprio vector in the trained declaration order.
+
+    ``include_gripper_joints=True``  -> 18-d = [joint_pos(12: 6 arm + 6 Robotiq mimic), ee_pose(6)].
+    ``include_gripper_joints=False`` -> 12-d = [arm_joint_pos(6), ee_pose(6)]; the 6 made-up
+    gripper mimic joints are dropped (the ``*_no_gripper`` models were trained without them).
+    """
+    joint_pos = (build_joint_pos(arm_joint_pos, gripper_pos_raw) if include_gripper_joints
+                 else np.asarray(arm_joint_pos, np.float32))
+    return np.concatenate([joint_pos, build_ee_pose(arm_joint_pos)]).astype(np.float32)
 
 
 def _looks_like_jit(path: str) -> bool:
@@ -130,5 +138,18 @@ class PointNetPolicy:
         return action[0] if squeeze else action
 
     def predict_from_state(self, points, arm_joint_pos, gripper_pos_raw) -> np.ndarray:
-        """Convenience: assemble proprio from raw robot scalars, then predict."""
-        return self.predict(points, build_proprio(arm_joint_pos, gripper_pos_raw))
+        """Convenience: assemble proprio from raw robot scalars, then predict.
+
+        Proprio layout follows the checkpoint's ``proprio_dim``: 18 -> arm+gripper joints+ee_pose;
+        12 -> arm joints + ee_pose only (``*_no_gripper`` models drop the mimic gripper joints).
+        """
+        if self.proprio_dim == 18:
+            include_gripper_joints = True
+        elif self.proprio_dim == 12:
+            include_gripper_joints = False
+        else:
+            raise ValueError(
+                f"unsupported proprio_dim {self.proprio_dim}; expected 18 (arm+gripper+ee) "
+                f"or 12 (arm+ee, no_gripper)")
+        return self.predict(
+            points, build_proprio(arm_joint_pos, gripper_pos_raw, include_gripper_joints))
