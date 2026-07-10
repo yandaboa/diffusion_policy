@@ -155,3 +155,7 @@ tactile_eval**/
 *.png
 *.ckpt
 *.npy
+
+# Keep sim2real camera calibrations tracked (override the global *.json ignore above).
+!scripts/sim2real/perception/calibrations/
+!scripts/sim2real/perception/calibrations/*.json
