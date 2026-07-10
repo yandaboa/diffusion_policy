@@ -24,6 +24,12 @@ tracker follows them. Controls (click the OpenCV window first):
   gripper macro, 'q'/Ctrl-C exit. On auto-termination (EE z>--z_terminate or timeout) you
   label the episode 's'=success / 'f'=fail (-> <save_dir>/eval_results.json).
 
+If the checkpoint carries a ``pc_signature`` (UWLab pc_signature.py; JIT ``.meta.json`` or
+Lightning hparams), the perception pipeline is configured FROM it: which classes to
+SAM2-prompt, the exact per-class point budget, seg channel on/off (3-ch models get an
+xyz-only cloud), and the proprio layout (incl. arm-6-only, no gripper joints). Checkpoints
+without one fall back to the legacy defaults (DEFAULT_BUDGET, robot/peg/hole, 4-ch cloud).
+
 ⚠ Two values to confirm on the real machine (see POINTCLOUD_EVAL.md):
   * --cartesian_scale must be the DATA-COLLECTION OSC scale (eval cfg uses
     0.01,0.01,0.002,0.02,0.02,0.2). If demos used a different scale, pass it explicitly.
@@ -43,7 +49,8 @@ import torch
 
 from diffusion_policy.real_world.real_env import RealEnv
 from diffusion_policy.common.precise_sleep import precise_wait
-from diffusion_policy.real_world.pointnet_policy import PointNetPolicy
+from diffusion_policy.real_world.pointnet_policy import (
+    PointNetPolicy, perception_from_signature)
 from diffusion_policy.real_world.pointcloud_builder import SEG_LABELS
 from diffusion_policy.real_world.ur5e_kinematics import (
     get_ee_pose, quat_to_axis_angle, apply_delta_pose)
@@ -153,6 +160,22 @@ def main(input, policy_format, output, robot_ip, front_serial, extrinsic, depth_
         f"expected 7-d action (6 OSC dpose + gripper), got {policy.action_dim}"
     print(f"Cartesian OSC scale: {CARTESIAN_SCALE}")
 
+    # Perception config from the checkpoint's PC observation signature (per-class budgets,
+    # which classes to SAM2-prompt, seg-label remap). None -> legacy defaults.
+    budget, prompt_classes, label_remap = perception_from_signature(policy.pc_signature, policy)
+
+    def policy_cloud(raw_cloud):
+        """Builder cloud (N, 4) -> the exact per-point layout the policy trained on:
+        slice off the seg channel for 3-ch (xyz-only) models, remap seg label values if the
+        trained convention differs from SEG_LABELS."""
+        if policy.point_dim == 3:
+            return raw_cloud[:, :3]
+        if label_remap:
+            lab = raw_cloud[:, 3].copy()
+            for src, dst in label_remap.items():
+                raw_cloud[:, 3][lab == src] = dst
+        return raw_cloud
+
     # ---- pick the recording/vis cameras (front cam is owned by the PC pipeline) -----------
     import pyrealsense2 as _rs
     connected = {d.get_info(_rs.camera_info.serial_number)
@@ -197,12 +220,13 @@ def main(input, policy_format, output, robot_ip, front_serial, extrinsic, depth_
             env.setup_pointcloud(
                 front_serial=front_serial, extrinsic=extrinsic, depth_source=depth_source,
                 resolution=capture_resolution, sam2_ckpt=sam2_ckpt, sam2_cfg=sam2_cfg,
-                erode=erode, crop_lo=crop_lo, crop_hi=crop_hi, ffs_mock=ffs_mock, device=device)
+                erode=erode, crop_lo=crop_lo, crop_hi=crop_hi, ffs_mock=ffs_mock, device=device,
+                budget=budget, prompt_classes=prompt_classes)
 
             print("Warming up policy inference...")
             obs = env.get_obs_pc()
             _ = policy.predict_from_state(
-                obs['point_cloud'], obs['arm_joint_pos'], float(obs['gripper_pos']))
+                policy_cloud(obs['point_cloud']), obs['arm_joint_pos'], float(obs['gripper_pos']))
             print('Ready!')
             time.sleep(1.0)
 
@@ -243,7 +267,7 @@ def main(input, policy_format, output, robot_ip, front_serial, extrinsic, depth_
                         # ---- observation: segmented EE-frame cloud + robot state ----
                         obs = env.get_obs_pc()
                         obs_timestamp = obs['timestamp']
-                        points = obs['point_cloud']           # (num_points, 4)
+                        points = policy_cloud(obs['point_cloud'])  # (num_points, point_dim)
                         arm_jp = obs['arm_joint_pos']         # (6,)
                         grip_raw = float(obs['gripper_pos'])
 
