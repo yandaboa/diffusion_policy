@@ -27,10 +27,7 @@ Finally, with the scene aligned physically and a decent estimate of extrinsics, 
 ```
 python pc_overlay_align.py   --sim_pc /home/yandabao/UWLab-patrick-private/scene_capture_front_orbbec_idx3_pc_base.npy   --calib /home/yandabao/diffusion_policy/scripts/sim2real/perception/calibrations/most_recent_charuco_calib.json
 ```
-<<<<<<< HEAD
 or to resume if we already have an extrinsic:
 ```
 python pc_overlay_align.py   --sim_pc /home/yandabao/UWLab-patrick-private/scene_capture_front_orbbec_idx3_pc_base.npy   --resume /home/yandabao/diffusion_policy/scripts/sim2real/perception/calibrations/most_recent_hand_aligned_extrinsic.json
 ```
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018

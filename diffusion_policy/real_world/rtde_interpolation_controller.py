@@ -367,19 +367,11 @@ class RTDEInterpolationController(mp.Process):
                 # update gripper state
                 if (current_gripper_close and
                         current_gripper_state == 'open'):
-<<<<<<< HEAD
                     gripper.move(gripper.get_closed_position(), 250, 128)
                     current_gripper_state = 'closed'
                 elif (not current_gripper_close and
                       current_gripper_state == 'closed'):
                     gripper.move(gripper.get_open_position(), 250, 128)
-=======
-                    gripper.move(gripper.get_closed_position(), 200, 128)
-                    current_gripper_state = 'closed'
-                elif (not current_gripper_close and
-                      current_gripper_state == 'closed'):
-                    gripper.move(gripper.get_open_position(), 200, 128)
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
                     current_gripper_state = 'open'
 
                 # update robot state

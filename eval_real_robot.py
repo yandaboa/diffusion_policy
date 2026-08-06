@@ -248,7 +248,6 @@ def _load_hole_pose(hole_pose_file, hole_pose):
 
 
 @click.command()
-<<<<<<< HEAD
 @click.option('--input', '-i', required=True, help='Path to TorchScript state policy (.pt).')
 @click.option('--output', '-o', required=True, help='Directory to save recording/results.')
 @click.option('--robot_ip', '-ri', required=True, help="UR5's IP e.g. 192.168.1.10")
@@ -282,40 +281,9 @@ def _load_hole_pose(hole_pose_file, hole_pose):
               help="Initialize robot joint configuration at startup.")
 @click.option('--max_duration', '-md', default=90, help='Max episode duration (s).')
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency (Hz).")
-=======
-@click.option('--input', '-i', required=True, help='Path to checkpoint')
-@click.option('--output', '-o', required=True, 
-              help='Directory to save recording')
-@click.option('--robot_ip', '-ri', required=True, 
-              help="UR5's IP address e.g. 192.168.1.10")
-@click.option('--match_dataset', '-m', default=None, 
-              help='Dataset used to overlay and adjust initial condition')
-@click.option('--match_episode', '-me', default=None, type=int, 
-              help='Match specific episode from the match dataset')
-@click.option('--vis_camera_idx', default=0, type=int,
-              help="Which RealSense camera to visualize.")
-@click.option('--cameras', '-c', default='side', type=str,
-              help="Comma-separated cameras to enable, from {front, side, wrist}. "
-                   "E.g. '--cameras side,wrist'. The order given determines the obs "
-                   "key assignment in RealEnv (3 cams -> front_rgb/side_rgb/wrist_rgb, "
-                   "fewer -> side_rgb/wrist_rgb). Cameras not physically connected are "
-                   "skipped with a warning.")
-@click.option('--init_joints', '-j', is_flag=True, default=False, 
-              help="Whether to initialize robot joint configuration in the "
-                   "beginning.")
-@click.option('--steps_per_inference', '-si', default=1, type=int, 
-              help="Action horizon for inference.")
-@click.option('--max_duration', '-md', default=16,
-              help='Max duration for each epoch in seconds.')
-@click.option('--frequency', '-f', default=10, type=float, 
-              help="Control frequency in Hz.")
-@click.option('--save_video', is_flag=True, default=False,
-              help='Save video of concatenated camera views.')
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
 @click.option('--action_noise', default=0.0, type=float,
               help='Std of Gaussian noise added to raw arm actions (pre-scale).')
 @click.option('--z_terminate', default=0.4, type=float,
-<<<<<<< HEAD
               help='Auto-terminate when EE z (base frame, m) exceeds this.')
 @click.option('--save_video/--no_save_video', default=True,
               help='Record per-episode video (ON by default). Writes the status canvas to '
@@ -330,24 +298,6 @@ def _load_hole_pose(hole_pose_file, hole_pose):
 def main(input, output, robot_ip, peg_state_file, peg_stale_s, launch_fusion, fusion_extra,
          hole_pose_file, hole_pose, hole_from_tags, hole_min_samples, init_joints, max_duration,
          frequency, action_noise, z_terminate, save_video, debug_obs, torch_device):
-=======
-              help='Auto-terminate the episode when the EE z height (REP-103 base '
-                   'frame, m) exceeds this value. After termination the user is '
-                   "prompted to label the episode ('s'=success, 'f'=fail).")
-@click.option('--input_res', default='1280x720', type=str,
-              help='Camera capture resolution as WxH. Defaults to 1280x720, '
-                   'the highest resolution common to D415/D435/D455 at 30fps. '
-                   'Policy obs resolution is set by the checkpoint independently.')
-def main(input, output, robot_ip, match_dataset, match_episode,
-         vis_camera_idx, cameras, init_joints,
-         steps_per_inference, max_duration,
-         frequency, save_video, action_noise, contact_threshold,
-         collect_sysid, plot_gripper, z_terminate, input_res):
-    # Parse camera capture resolution
-    capture_w, capture_h = (int(x) for x in input_res.lower().split('x'))
-    capture_resolution = (capture_w, capture_h)
-    print(f"Camera capture resolution: {capture_resolution}")
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
 
     output = pathlib.Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -433,116 +383,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
         print(f"  [{n_succ}/{n_tot} success] saved to {output / 'eval_results.json'}")
         return result
 
-<<<<<<< HEAD
     dt = 1 / frequency
-=======
-    # load match_dataset
-    match_camera_idx = 0
-    episode_first_frame_map = dict()
-    if match_dataset is not None:
-        match_dir = pathlib.Path(match_dataset)
-        match_video_dir = match_dir.joinpath('videos')
-        for vid_dir in match_video_dir.glob("*/"):
-            episode_idx = int(vid_dir.stem)
-            match_video_path = vid_dir.joinpath(f'{match_camera_idx}.mp4')
-            if match_video_path.exists():
-                frames = skvideo.io.vread(
-                    str(match_video_path), num_frames=1)
-                episode_first_frame_map[episode_idx] = frames[0]
-    print(f"Loaded initial frame for {len(episode_first_frame_map)} episodes")
-    
-    # load checkpoint
-    device = TorchUtils.get_torch_device(try_to_use_cuda=True)
-
-    # Named camera registry: name -> (serial, config path). RealEnv assigns obs
-    # keys positionally by camera count (3 -> front/side/wrist_rgb, fewer ->
-    # side/wrist_rgb), so the --cameras order also controls the obs key naming.
-    CAMERA_REGISTRY = {
-        'front': ('215122255213', 'diffusion_policy/real_world/realsense_config/455_front.json'),
-        'side':  ('832112070487', 'diffusion_policy/real_world/realsense_config/435_side.json'),
-        'wrist': ('746112060198', 'diffusion_policy/real_world/realsense_config/415_wrist.json'),
-    }
-    requested = [c.strip().lower() for c in cameras.split(',') if c.strip()]
-    unknown = [c for c in requested if c not in CAMERA_REGISTRY]
-    if unknown:
-        raise ValueError(
-            f"Unknown camera(s) {unknown}; choose from {list(CAMERA_REGISTRY)}.")
-    if not requested:
-        raise ValueError("No cameras requested; pass --cameras e.g. 'side,wrist'.")
-
-    # Detect which cameras are physically connected and filter accordingly.
-    import pyrealsense2 as _rs
-    _connected = {
-        d.get_info(_rs.camera_info.serial_number)
-        for d in _rs.context().devices
-        if d.get_info(_rs.camera_info.name).lower() != 'platform camera'
-    }
-    _missing = [name for name in requested
-                if CAMERA_REGISTRY[name][0] not in _connected]
-    if _missing:
-        print(f"Warning: cameras not connected, skipping: {_missing}")
-    _active = [name for name in requested
-               if CAMERA_REGISTRY[name][0] in _connected]
-    camera_serial_numbers = [CAMERA_REGISTRY[name][0] for name in _active]
-    configs = [json.load(open(CAMERA_REGISTRY[name][1])) for name in _active]
-    print(f"Active cameras: {list(zip(_active, camera_serial_numbers))}")
-
-    ckpt_path = input
-    payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
-    cfg = payload['cfg']
-    cls = hydra.utils.get_class(cfg._target_)
-    if 'extra_randomizations' in cfg['policy']['obs_encoder']:
-        cfg['policy']['obs_encoder']['extra_randomizations'] = []
-    workspace = cls(cfg)
-    workspace: BaseWorkspace
-    workspace.load_payload(payload, exclude_keys=None, include_keys=None)
-
-    # hacks for method-specific setup.
-    policy: BaseImagePolicy
-    policy = workspace.model
-    if cfg.training.use_ema:
-        policy = workspace.ema_model
-
-    policy.eval().to(device)
-
-    # Diffusion-specific overrides (no-op for MLP / Transformer policies)
-    if hasattr(policy, 'num_inference_steps'):
-        policy.num_inference_steps = 16  # DDIM inference iterations
-        policy.n_action_steps = policy.horizon - policy.n_obs_steps + 1
-
-    # In-context (TransformerImagePolicy) needs per-episode obs history.
-    # Cap at training horizon so we never overflow GPT2 positional embeddings.
-    is_in_context = isinstance(policy, TransformerImagePolicy)
-    obs_history = {}
-    in_context_max_history = int(cfg.get('horizon', 256))
-    if is_in_context:
-        print(f"In-context policy detected; obs history capped at {in_context_max_history} steps.")
-
-    # setup experiments
-    dt = 1/frequency
-    obs_res = get_real_obs_resolution(cfg['task']['shape_meta'])
-    if obs_res is None:
-        obs_res = (640, 480)  # no image obs in checkpoint; use capture resolution for recording
-    n_obs_steps = cfg['n_obs_steps']
-    n_action_steps = cfg['n_action_steps']
-    print("n_obs_steps: ", n_obs_steps)
-    print("steps_per_inference: ", steps_per_inference)
-    print("n_action_steps: ", n_action_steps)
-
-    # Action-space layout from the checkpoint. The last dim is the binary gripper;
-    # the remaining arm dims are either 6 (full Cartesian pose delta) or 3 (position-only).
-    action_dim = int(cfg['shape_meta']['action']['shape'][0])
-    arm_action_dim = action_dim - 1
-    if arm_action_dim not in (3, 6):
-        raise ValueError(
-            f"Unsupported action_dim={action_dim}; expected 4 (3 arm + gripper) "
-            f"or 7 (6 arm + gripper).")
-    position_only = (arm_action_dim == 3)
-    CARTESIAN_SCALE = CARTESIAN_SCALE_POSONLY if position_only else CARTESIAN_SCALE_6DOF
-    print(f"action_dim: {action_dim} ({arm_action_dim} arm + 1 gripper), "
-          f"position_only={position_only}")
-    print(f"Cartesian OSC scale: {CARTESIAN_SCALE}")
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
 
     with SharedMemoryManager() as shm_manager:
         with RealEnv(
@@ -811,7 +652,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         # status canvas + key handling
                         ee_z = float(obs_pos[2])
                         episode_id = env.replay_buffer.n_episodes
-<<<<<<< HEAD
                         canvas = np.zeros((240, 640, 3), dtype=np.uint8)
                         lines = [
                             f"Episode {episode_id}  t={time.monotonic() - t_start:5.1f}s",
@@ -827,26 +667,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         cv2.imshow('Policy Control', canvas)
                         if save_video and episode_video_writer is not None:
                             episode_video_writer.append_data(canvas[..., ::-1])
-=======
-                        camera_key = 'side_rgb'
-                        if camera_key in obs:
-                            vis_img = obs[camera_key][-1]
-                            text = 'Episode: {}, Time: {:.1f}'.format(
-                                episode_id, time.monotonic() - t_start
-                            )
-                            cv2.putText(
-                                vis_img,
-                                text,
-                                (10,20),
-                                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                                fontScale=0.5,
-                                thickness=1,
-                                color=(255,255,255)
-                            )
-                            cv2.imshow('Policy Control', vis_img[...,::-1])
-                        
-                        ee_z = float(obs_pos[2])  # EE height (REP-103 base frame)
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
 
                         key_stroke = cv2.pollKey()
                         if key_stroke == ord('g'):
@@ -868,11 +688,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                                 episode_video_writer = None
                             env.robot.reset_to_initial_position()
                             prompt_success_fail(episode_id, ee_z)
-<<<<<<< HEAD
-=======
-                            
-                            # Wait a moment for robot to settle
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
                             time.sleep(5.0)
                             latch_hole_pose(f" ep{env.replay_buffer.n_episodes}:")
                             history.clear()
@@ -899,11 +714,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             print('Terminated by timeout!')
                         if terminate:
                             env.end_episode()
-<<<<<<< HEAD
                             set_recording(False)
-=======
-                            obs_history.clear()
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
                             if save_video and episode_video_writer is not None:
                                 episode_video_writer.close()
                                 episode_video_writer = None

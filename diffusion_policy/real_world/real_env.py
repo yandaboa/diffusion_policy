@@ -66,11 +66,7 @@ def _open_front_realsense_depth(serial, resolution):
 
 
 @contextlib.contextmanager
-<<<<<<< HEAD
 def _open_front_orbbec(serial, resolution, flying_pixel_thresh_mm=None):
-=======
-def _open_front_orbbec(serial, resolution):
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
     """Persistent front-Orbbec (Femto Bolt) stream for the point-cloud obs path.
 
     Orbbec twin of ``_open_front_realsense_depth``. Opens color + depth, software-aligns depth
@@ -81,22 +77,16 @@ def _open_front_orbbec(serial, resolution):
     color frame, already in the COLOR optical frame -- so they line up 1:1 with the SAM2 masks
     (which run on that same color image) and need NO IR->color warp. Positions are converted mm->m.
     Only one Orbbec is supported (``open_camera`` opens the first device); ``serial`` is advisory.
-<<<<<<< HEAD
 
     ``flying_pixel_thresh_mm``: if set, ToF flying pixels (mixed pixels streaking between fg
     edges and the background) are removed from the grid by local depth-range thresholding
     (``pointcloud_builder.flying_pixel_mask``); their xyz is zeroed, i.e. the same "invalid"
     convention (z=0) the cloud build already discards. None leaves the grid unfiltered.
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
     """
     from orbbec.orbbec_camera import (
         open_camera, warmup_autoexposure, capture_aligned, color_intrinsics,
         make_pointcloud_filter, orbbec_pointcloud)
-<<<<<<< HEAD
     from diffusion_policy.real_world.pointcloud_builder import flying_pixel_mask
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
     w, h = tuple(resolution)
     pipe, align = open_camera(serial, w, h, 30)
     try:
@@ -108,13 +98,10 @@ def _open_front_orbbec(serial, resolution):
             color, fs = capture_aligned(pipe, align)
             grid = orbbec_pointcloud(pcf, fs)            # (H,W,6) xyz(mm) + rgb
             xyz_m = (grid[..., :3] / 1000.0).astype(np.float32)   # mm -> m, color frame
-<<<<<<< HEAD
             if flying_pixel_thresh_mm is not None:
                 flying = flying_pixel_mask(
                     xyz_m[..., 2], thresh=flying_pixel_thresh_mm * 1e-3)
                 xyz_m[flying] = 0.0
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
             rgb = grid[..., 3:6].astype(np.uint8)
             return color, xyz_m, rgb, K
 
@@ -123,7 +110,6 @@ def _open_front_orbbec(serial, resolution):
         pipe.stop()
 
 
-<<<<<<< HEAD
 def _rotmat_to_quat_wxyz(R):
     """(3,3) rotation matrix -> (w,x,y,z) unit quaternion (numpy, no scipy dep)."""
     m = np.asarray(R, np.float64)
@@ -144,8 +130,6 @@ def _rotmat_to_quat_wxyz(R):
     return (q / np.linalg.norm(q)).astype(np.float32)
 
 
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
 class RealEnv:
     def __init__(self,
             # required params
@@ -610,10 +594,7 @@ class RealEnv:
             prompt_classes=None,
             ffs_mock=False,
             segment=True,
-<<<<<<< HEAD
             flying_pixel_mm=None,
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
             device=None):
         """Stand up the front-camera point-cloud pipeline used by ``get_obs_pc``.
 
@@ -643,12 +624,9 @@ class RealEnv:
                 path. Set False to skip segmentation entirely -- no SAM2 load, no click prompts --
                 so ``grab_segmented_cloud_camera_frame`` returns the FULL raw cloud (every valid
                 point, label NaN). Used by the perception-gap probe. ``get_obs_pc`` requires True.
-<<<<<<< HEAD
             flying_pixel_mm: Orbbec only -- drop flying pixels whose 3x3 local depth range
                 exceeds this many mm (see ``_open_front_orbbec``). None disables. Ignored for
                 'ffs'/'realsense' depth sources.
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
             device: torch device for the on-GPU cloud build (defaults to the SAM2 device, or
                 cuda/cpu autodetect when ``segment`` is False).
         """
@@ -690,15 +668,11 @@ class RealEnv:
             def collect_depth():
                 return pending.pop('depth')
         elif depth_source == 'orbbec':
-<<<<<<< HEAD
             if flying_pixel_mm is not None:
                 print(f"[RealEnv] Orbbec flying-pixel filter ON "
                       f"(3x3 local range > {flying_pixel_mm:.0f} mm -> dropped)")
             grab_ob = stack.enter_context(_open_front_orbbec(
                 front_serial, resolution, flying_pixel_thresh_mm=flying_pixel_mm))
-=======
-            grab_ob = stack.enter_context(_open_front_orbbec(front_serial, resolution))
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
             pending = {}
 
             def grab():
@@ -953,7 +927,6 @@ class RealEnv:
             K=np.asarray(K), warp=warp, timestamp=ts,
         )
 
-<<<<<<< HEAD
     def setup_pose_estimation(self,
             mesh_path,
             extrinsic,
@@ -1143,8 +1116,6 @@ class RealEnv:
         ps['latest'] = self._make_pose_obs(pose_cam, K=K, color=color, depth=depth_m, ts=ts)
         return dict(ps['latest'])
 
-=======
->>>>>>> e45600ad44308afb130bb705f0d3983853f65018
     def exec_actions(self,
             actions: np.ndarray,
             timestamps: np.ndarray,
