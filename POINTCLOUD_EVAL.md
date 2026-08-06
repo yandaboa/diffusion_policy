@@ -321,3 +321,8 @@ no prev_actions; action = OSC Δpose(6) + binary gripper(1).
 
 The spec is complete enough to write `pointcloud_builder.py`, `pointnet_policy.py`,
 and `debug_pointcloud.py` against concrete numbers now; items 1–3 are local choices.
+
+Command:
+```
+python eval_real_robot_pc.py -i /home/yandabao/diffusion_policy/pc_policies/big_no_gripper.pt  -o tmp/pc_eval_$(date +%s)         --robot_ip 192.168.1.10 -j --save_video -j
+```

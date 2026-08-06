@@ -8,7 +8,9 @@ reconstruction from real-robot scalars.
 Locked to ``pnocc_xl_residual_big_ee``:
   * cloud   : (num_points, 4) = xyz + seg label {robot:0, peg:-1, hole:+1}, in EE frame
   * proprio : 18-d = [joint_pos(12: 6 arm + 6 Robotiq mimic, rad), ee_pose(6: xyz +
-              axis-angle, wrist_3_link in BASE frame)]  -- declaration order, NO prev_actions
+              axis-angle, wrist_3_link in BASE frame)]  -- declaration order, NO prev_actions.
+              ``*_no_gripper`` checkpoints use 12-d = [arm_joint_pos(6), ee_pose(6)] (the 6
+              mimic gripper joints dropped); selected by the checkpoint's proprio_dim.
   * action  : 7-d = RelCartesian OSC dpose(6) + binary gripper(1), denormalized
 """
 
@@ -48,11 +50,17 @@ def build_ee_pose(arm_joint_pos: np.ndarray) -> np.ndarray:
     return np.concatenate([pos, quat_to_axis_angle(quat)]).astype(np.float32)
 
 
-def build_proprio(arm_joint_pos: np.ndarray, gripper_pos_raw: float) -> np.ndarray:
-    """Assemble the 18-d proprio vector in the trained declaration order."""
-    return np.concatenate(
-        [build_joint_pos(arm_joint_pos, gripper_pos_raw), build_ee_pose(arm_joint_pos)]
-    ).astype(np.float32)
+def build_proprio(arm_joint_pos: np.ndarray, gripper_pos_raw: float,
+                  include_gripper_joints: bool = True) -> np.ndarray:
+    """Assemble the proprio vector in the trained declaration order.
+
+    ``include_gripper_joints=True``  -> 18-d = [joint_pos(12: 6 arm + 6 Robotiq mimic), ee_pose(6)].
+    ``include_gripper_joints=False`` -> 12-d = [arm_joint_pos(6), ee_pose(6)]; the 6 made-up
+    gripper mimic joints are dropped (the ``*_no_gripper`` models were trained without them).
+    """
+    joint_pos = (build_joint_pos(arm_joint_pos, gripper_pos_raw) if include_gripper_joints
+                 else np.asarray(arm_joint_pos, np.float32))
+    return np.concatenate([joint_pos, build_ee_pose(arm_joint_pos)]).astype(np.float32)
 
 
 def _looks_like_jit(path: str) -> bool:
@@ -97,18 +105,29 @@ class PointNetPolicy:
             self.num_points = hp.get("num_points")
             self.proprio_dim = int(self.bc["proprio_mean"].shape[0])
             self.action_dim = int(self.bc["action_mean"].shape[0])
+        # None -> auto-pick from proprio_dim (18=with gripper, 12=without) in predict_from_state.
+        # Set True/False to force the layout regardless of the (often absent) proprio_dim metadata.
+        self.include_gripper_joints = None
+        # Action sampling: False -> deterministic mean action; True -> sample from the policy's
+        # Gaussian head, action ~ N(mean, (temperature * exp(log_std))^2), denormalized. Requires
+        # a predict_std=True EAGER checkpoint -- the JIT trace bakes in the mean and drops the std.
+        self.sample = False
+        self.sample_temperature = 1.0
 
     @torch.no_grad()
-    def predict(self, points, proprio) -> np.ndarray:
+    def predict(self, points, proprio, sample: bool = None) -> np.ndarray:
         """Run the policy. Returns the denormalized action in env units.
 
         Args:
             points:  (N, point_dim) or (B, N, point_dim) -- cloud, 4th channel = seg label.
             proprio: (proprio_dim,) or (B, proprio_dim) -- raw; z-scoring is applied (eager) or
                      baked into the traced graph (jit).
+            sample:  None -> use ``self.sample``; True/False overrides it. When true, draw the
+                     action from the policy's Gaussian head instead of taking the mean.
         Returns:
             (action_dim,) if a single sample was given, else (B, action_dim).
         """
+        do_sample = self.sample if sample is None else bool(sample)
         pts = torch.as_tensor(np.asarray(points), dtype=torch.float32, device=self.device)
         pr = torch.as_tensor(np.asarray(proprio), dtype=torch.float32, device=self.device)
         squeeze = pts.ndim == 2
@@ -120,15 +139,58 @@ class PointNetPolicy:
         assert pr.shape[-1] == self.proprio_dim, f"proprio dim {pr.shape[-1]} != {self.proprio_dim}"
 
         if self.jit:
-            action = self.model(pts, pr)  # forward bakes in proprio z-score + action denorm
+            # Two JIT export flavors (both bake in proprio z-score + action denorm):
+            #   mean-only  -> forward returns a single denormalized-mean Tensor.
+            #   std export -> forward returns (mean, std), BOTH already denormalized to env action
+            #                 units (std = exp(clamp(log_std)) * action_std), so sampling is just
+            #                 mean + temperature * std * eps -- no further denorm here.
+            out = self.model(pts, pr)
+            if isinstance(out, (tuple, list)):
+                mean, std = out[0], out[1]
+                action = (mean + self.sample_temperature * std * torch.randn_like(mean)
+                          if do_sample else mean)
+            else:
+                if do_sample:
+                    raise RuntimeError(
+                        "this JIT export returns only the mean (no std head). Re-export the JIT "
+                        "with predict_std so forward returns (mean, std), or load the eager .ckpt.")
+                action = out
         else:
             pr_n = (pr - self.bc["proprio_mean"]) / self.bc["proprio_std"]
             out = self.model(pts, pr_n)
-            mean = out[0] if isinstance(out, tuple) else out  # predict_std -> (mean, log_std)
-            action = mean * self.bc["action_std"] + self.bc["action_mean"]
+            if isinstance(out, tuple):  # predict_std=True -> (mean, log_std), both (B, action_dim)
+                mean, log_std = out
+                if do_sample:
+                    std = torch.exp(log_std) * self.sample_temperature
+                    action_n = mean + std * torch.randn_like(mean)
+                else:
+                    action_n = mean
+            else:  # predict_std=False -> deterministic mean only
+                if do_sample:
+                    raise RuntimeError(
+                        "cannot sample: this checkpoint was trained with predict_std=False, so the "
+                        "model has no std head (forward returns a single mean tensor).")
+                action_n = out
+            action = action_n * self.bc["action_std"] + self.bc["action_mean"]
         action = action.cpu().numpy()
         return action[0] if squeeze else action
 
     def predict_from_state(self, points, arm_joint_pos, gripper_pos_raw) -> np.ndarray:
-        """Convenience: assemble proprio from raw robot scalars, then predict."""
-        return self.predict(points, build_proprio(arm_joint_pos, gripper_pos_raw))
+        """Convenience: assemble proprio from raw robot scalars, then predict.
+
+        Proprio layout: if ``self.include_gripper_joints`` is set (True/False) it is authoritative;
+        otherwise it is auto-picked from ``proprio_dim`` (18 -> arm+gripper joints+ee_pose;
+        12 -> arm joints + ee_pose only, the ``*_no_gripper`` layout with the mimic joints dropped).
+        """
+        if self.include_gripper_joints is not None:
+            include_gripper_joints = self.include_gripper_joints
+        elif self.proprio_dim == 18:
+            include_gripper_joints = True
+        elif self.proprio_dim == 12:
+            include_gripper_joints = False
+        else:
+            raise ValueError(
+                f"unsupported proprio_dim {self.proprio_dim}; expected 18 (arm+gripper+ee) "
+                f"or 12 (arm+ee, no_gripper)")
+        return self.predict(
+            points, build_proprio(arm_joint_pos, gripper_pos_raw, include_gripper_joints))

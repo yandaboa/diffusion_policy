@@ -6,10 +6,14 @@ Mello teleop for UR5e: move the arm with the Mello device and optionally record 
 See README_ur5e.md for UR5e and Mello setup. If the robot stalls,
 tune gains with --osc_kp_pos and --osc_kp_rot. Keys: C=start record, S=stop, Q=quit,
 Backspace=drop last episode. Use --debug for fixed joint positions (no Mello).
+
+Cameras are configured via the CAMERA_SPECS list below (serials + configs).
+DA3 depth inference is off by default; pass --enable_da3 to turn it on.
 """
 
 # %%
 import time
+from contextlib import nullcontext
 from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
@@ -28,9 +32,19 @@ from diffusion_policy.real_world.da3_depth_client import DA3DepthClient
 _DEPTH_CLIP = (0.01, 2.0)   # metres
 _DEPTH_IMG_H, _DEPTH_IMG_W = 224, 224
 
-# Camera order in RealEnv: 0=front, 1=side, 2=wrist
-_SIDE_SERIAL  = '832112070487'
-_WRIST_SERIAL = '746112060198'
+# ── Camera configuration ────────────────────────────────────────────────────
+# Single source of truth for which cameras are used and in what order. RealEnv
+# names cameras by index: 3 cameras → front/side/wrist, 2 → side/wrist. To change
+# the camera setup, edit this list (order = camera index in RealEnv). Each entry:
+#   name   → produces obs key "<name>_rgb"
+#   serial → RealSense device serial number
+#   config → RealSense advanced-mode JSON in _CONFIG_DIR
+_CONFIG_DIR = "diffusion_policy/real_world/realsense_config/"
+CAMERA_SPECS = [
+    # {'name': 'front', 'serial': '215122255213', 'config': '455_front.json'},
+    {'name': 'side',  'serial': '832112070487', 'config': '435_side.json'},
+    # {'name': 'wrist', 'serial': '746112060198', 'config': '415_wrist.json'},
+]
 
 
 
@@ -66,30 +80,31 @@ def _metric_to_bgr(depth_m: np.ndarray, d_max: float = 3.0) -> np.ndarray:
 @click.option('--debug', is_flag=True, help="Use dummy Mello interface with fixed joint positions for testing.")
 @click.option('--osc_kp_pos', default=1000.0, type=float, help="OSC position stiffness (default 1000)")
 @click.option('--osc_kp_rot', default=50.0, type=float, help="OSC rotation stiffness (default 50)")
-def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, command_latency, debug, osc_kp_pos, osc_kp_rot):
+@click.option('--enable_da3', is_flag=True, default=False, help="Enable DA3 depth model inference and fused-depth visualization (off by default).")
+def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, command_latency, debug, osc_kp_pos, osc_kp_rot, enable_da3):
 
-    configs = [
-        json.load(open("diffusion_policy/real_world/realsense_config/"
-                      "455_front.json")),
-        json.load(open("diffusion_policy/real_world/realsense_config/"
-                      "435_side.json")),
-        json.load(open("diffusion_policy/real_world/realsense_config/"
-                      "415_wrist.json"))
-    ]
+    # Build camera serials/configs from the single CAMERA_SPECS source of truth.
+    camera_serial_numbers = [spec['serial'] for spec in CAMERA_SPECS]
+    configs = [json.load(open(_CONFIG_DIR + spec['config'])) for spec in CAMERA_SPECS]
+    # Locate side/wrist cameras by name (used for depth viz + DA3 fusion).
+    _name_to_idx = {spec['name']: i for i, spec in enumerate(CAMERA_SPECS)}
+    side_idx  = _name_to_idx.get('side')
+    wrist_idx = _name_to_idx.get('wrist')
+    has_depth_pair = side_idx is not None and wrist_idx is not None
 
     dt = 1/frequency
     with SharedMemoryManager() as shm_manager:
         MelloInterface = DummyMelloTeleopInterface if debug else MelloTeleopInterface
         mello_kwargs = {} if debug else {'port': mello_port}
-        with DA3DepthClient(device=0) as da3_client, \
+        da3_ctx = DA3DepthClient(device=0) if enable_da3 else nullcontext()
+        with da3_ctx as da3_client, \
              KeystrokeCounter() as key_counter, \
              MelloInterface(**mello_kwargs) as mello, \
             RealEnv(
                 output_dir=output,
                 robot_ip=robot_ip,
                 obs_image_resolution=(640,480),
-                camera_serial_numbers=['215122255213', '832112070487',
-                        '746112060198'],
+                camera_serial_numbers=camera_serial_numbers,
                 camera_configs=configs,
                 frequency=frequency,
                 init_joints=init_joints,
@@ -116,53 +131,65 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
             print(f'OSC: Kp_pos={osc_kp_pos}, Kp_rot={osc_kp_rot}, Kd_pos={kd_pos:.1f}, Kd_rot={kd_rot:.1f}')
             print('Ready!')
 
-            print('Waiting for DA3 model to be ready (loading in background)...')
-            da3_client.wait_ready(timeout=120.0)
-            print('DA3 model ready.')
+            # ── Depth setup (side|wrist) — only if both cameras are present ──
+            _side_depth_scale = _wrist_depth_scale = None
+            _SIDE_FOCAL_PX = _WRIST_FOCAL_PX = None
+            _depth_writer = _fused_writer = _fused_raw_writer = None
+            _depth_video_path = _fused_video_path = _fused_raw_video_path = None
+            if has_depth_pair:
+                _side_serial  = CAMERA_SPECS[side_idx]['serial']
+                _wrist_serial = CAMERA_SPECS[wrist_idx]['serial']
+                # Depth scales and intrinsics — read once after cameras are ready
+                _side_depth_scale  = env.realsense.cameras[_side_serial].get_depth_scale()
+                _wrist_depth_scale = env.realsense.cameras[_wrist_serial].get_depth_scale()
+                _side_K  = env.realsense.cameras[_side_serial].get_intrinsics()
+                _wrist_K = env.realsense.cameras[_wrist_serial].get_intrinsics()
+                _SIDE_FOCAL_PX  = float(_side_K[0, 0] + _side_K[1, 1]) / 2.0
+                _WRIST_FOCAL_PX = float(_wrist_K[0, 0] + _wrist_K[1, 1]) / 2.0
+                print(f'Depth scales — side: {_side_depth_scale:.5f}, wrist: {_wrist_depth_scale:.5f}')
+                print(f'Focal lengths — side: {_SIDE_FOCAL_PX:.1f} px, wrist: {_WRIST_FOCAL_PX:.1f} px')
+                cv2.namedWindow('Depth', cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('Depth', _DEPTH_IMG_W * 2, _DEPTH_IMG_H)
 
-            # Depth scales and intrinsics — read once after cameras are ready
-            _side_depth_scale  = env.realsense.cameras[_SIDE_SERIAL].get_depth_scale()
-            _wrist_depth_scale = env.realsense.cameras[_WRIST_SERIAL].get_depth_scale()
-            _side_K  = env.realsense.cameras[_SIDE_SERIAL].get_intrinsics()
-            _wrist_K = env.realsense.cameras[_WRIST_SERIAL].get_intrinsics()
-            _SIDE_FOCAL_PX  = float(_side_K[0, 0] + _side_K[1, 1]) / 2.0
-            _WRIST_FOCAL_PX = float(_wrist_K[0, 0] + _wrist_K[1, 1]) / 2.0
-            print(f'Depth scales — side: {_side_depth_scale:.5f}, wrist: {_wrist_depth_scale:.5f}')
-            print(f'Focal lengths — side: {_SIDE_FOCAL_PX:.1f} px, wrist: {_WRIST_FOCAL_PX:.1f} px')
-            cv2.namedWindow('Depth', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('Depth', _DEPTH_IMG_W * 2, _DEPTH_IMG_H)
+                # Depth video writer — saves side|wrist panel to output dir
+                _depth_video_path = output + '/depth_preview.mp4'
+                _depth_writer = cv2.VideoWriter(
+                    _depth_video_path,
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    frequency,
+                    (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
+                )
+                print(f'Depth video → {_depth_video_path}')
 
-            # Depth video writer — saves side|wrist panel to output dir
-            _depth_video_path = output + '/depth_preview.mp4'
-            _depth_writer = cv2.VideoWriter(
-                _depth_video_path,
-                cv2.VideoWriter_fourcc(*'mp4v'),
-                frequency,
-                (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
-            )
-            print(f'Depth video → {_depth_video_path}')
+            # ── DA3 setup — only when explicitly enabled via --enable_da3 ────
+            if enable_da3:
+                if not has_depth_pair:
+                    raise RuntimeError('--enable_da3 requires both "side" and "wrist" cameras in CAMERA_SPECS')
+                print('Waiting for DA3 model to be ready (loading in background)...')
+                da3_client.wait_ready(timeout=120.0)
+                print('DA3 model ready.')
 
-            # DA3-fused depth video writer (separate file, same dimensions)
-            _fused_video_path = output + '/da3_fused_depth.mp4'
-            _fused_writer = cv2.VideoWriter(
-                _fused_video_path,
-                cv2.VideoWriter_fourcc(*'mp4v'),
-                frequency,
-                (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
-            )
-            print(f'DA3 fused depth video → {_fused_video_path}')
+                # DA3-fused depth video writer (separate file, same dimensions)
+                _fused_video_path = output + '/da3_fused_depth.mp4'
+                _fused_writer = cv2.VideoWriter(
+                    _fused_video_path,
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    frequency,
+                    (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
+                )
+                print(f'DA3 fused depth video → {_fused_video_path}')
 
-            # DA3-fused depth video without colour overlay (pure depth colourmap)
-            _fused_raw_video_path = output + '/da3_fused_depth_raw.mp4'
-            _fused_raw_writer = cv2.VideoWriter(
-                _fused_raw_video_path,
-                cv2.VideoWriter_fourcc(*'mp4v'),
-                frequency,
-                (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
-            )
-            print(f'DA3 fused depth (raw) video → {_fused_raw_video_path}')
-            cv2.namedWindow('DA3 Fused Depth', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('DA3 Fused Depth', _DEPTH_IMG_W * 2, _DEPTH_IMG_H)
+                # DA3-fused depth video without colour overlay (pure depth colourmap)
+                _fused_raw_video_path = output + '/da3_fused_depth_raw.mp4'
+                _fused_raw_writer = cv2.VideoWriter(
+                    _fused_raw_video_path,
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    frequency,
+                    (_DEPTH_IMG_W * 2, _DEPTH_IMG_H),
+                )
+                print(f'DA3 fused depth (raw) video → {_fused_raw_video_path}')
+                cv2.namedWindow('DA3 Fused Depth', cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('DA3 Fused Depth', _DEPTH_IMG_W * 2, _DEPTH_IMG_H)
             t_start = time.monotonic()
             iter_idx = 0
             stop = False
@@ -180,7 +207,8 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
 
                 # Fire off DA3 inference now; collect results after visualization
                 # so the ~43 ms model forward pass overlaps with other loop work.
-                da3_client.submit(obs['side_rgb'][-1], obs['wrist_rgb'][-1])
+                if enable_da3:
+                    da3_client.submit(obs['side_rgb'][-1], obs['wrist_rgb'][-1])
 
                 press_events = key_counter.get_press_events()
                 for key_stroke in press_events:
@@ -204,7 +232,7 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 stage = key_counter[Key.space]
 
                 # visualize
-                _cam_keys = ['front_rgb', 'side_rgb', 'wrist_rgb']
+                _cam_keys = [spec['name'] + '_rgb' for spec in CAMERA_SPECS]
                 vis_img = obs[_cam_keys[vis_camera_idx]][-1,:,:,::-1].copy()
                 episode_id = env.replay_buffer.n_episodes
                 text = f'Episode: {episode_id}, Stage: {stage}'
@@ -233,9 +261,9 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 cv2.imshow('default', vis_img)
 
                 # ── Depth visualisation (side | wrist) with colour overlay ──
-                if env.last_realsense_data is not None:
-                    side_raw  = env.last_realsense_data[1].get('depth')
-                    wrist_raw = env.last_realsense_data[2].get('depth')
+                if has_depth_pair and env.last_realsense_data is not None:
+                    side_raw  = env.last_realsense_data[side_idx].get('depth')
+                    wrist_raw = env.last_realsense_data[wrist_idx].get('depth')
                     if side_raw is not None and wrist_raw is not None:
                         side_vis  = _depth_to_bgr(_process_depth(side_raw[-1],  _side_depth_scale))
                         wrist_vis = _depth_to_bgr(_process_depth(wrist_raw[-1], _wrist_depth_scale))
@@ -252,12 +280,12 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                         _depth_writer.write(depth_panel)
 
                 # ── DA3 fused depth (collect result submitted above) ─────────
-                _da3_side_raw, _da3_wrist_raw = da3_client.collect()
-                _da3_side_m  = DA3DepthClient.to_metric(_da3_side_raw,  _SIDE_FOCAL_PX)
-                _da3_wrist_m = DA3DepthClient.to_metric(_da3_wrist_raw, _WRIST_FOCAL_PX)
-                if env.last_realsense_data is not None:
-                    _rs_side  = env.last_realsense_data[1].get('depth')
-                    _rs_wrist = env.last_realsense_data[2].get('depth')
+                if enable_da3 and env.last_realsense_data is not None:
+                    _da3_side_raw, _da3_wrist_raw = da3_client.collect()
+                    _da3_side_m  = DA3DepthClient.to_metric(_da3_side_raw,  _SIDE_FOCAL_PX)
+                    _da3_wrist_m = DA3DepthClient.to_metric(_da3_wrist_raw, _WRIST_FOCAL_PX)
+                    _rs_side  = env.last_realsense_data[side_idx].get('depth')
+                    _rs_wrist = env.last_realsense_data[wrist_idx].get('depth')
                     if _rs_side is not None and _rs_wrist is not None:
                         _fused_side  = DA3DepthClient.fuse_with_realsense(
                             _da3_side_m,  _rs_side[-1],  _side_depth_scale)
@@ -306,12 +334,15 @@ def main(output, robot_ip, mello_port, vis_camera_idx, init_joints, frequency, c
                 precise_wait(t_cycle_end)
                 iter_idx += 1
 
-            _depth_writer.release()
-            print(f'Depth video saved → {_depth_video_path}')
-            _fused_writer.release()
-            print(f'DA3 fused depth video saved → {_fused_video_path}')
-            _fused_raw_writer.release()
-            print(f'DA3 fused depth (raw) video saved → {_fused_raw_video_path}')
+            if _depth_writer is not None:
+                _depth_writer.release()
+                print(f'Depth video saved → {_depth_video_path}')
+            if _fused_writer is not None:
+                _fused_writer.release()
+                print(f'DA3 fused depth video saved → {_fused_video_path}')
+            if _fused_raw_writer is not None:
+                _fused_raw_writer.release()
+                print(f'DA3 fused depth (raw) video saved → {_fused_raw_video_path}')
 
             # Plot inner_finger_knuckle_joint after session ends
             if finger_log:

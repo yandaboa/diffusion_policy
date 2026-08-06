@@ -41,6 +41,42 @@ class CloudStats:
     bbox_max: Optional[np.ndarray] = None
 
 
+def flying_pixel_mask(z: np.ndarray, thresh: float, ksize: int = 3) -> np.ndarray:
+    """Boolean mask of flying pixels in a dense z/depth grid (True = drop).
+
+    ToF flying pixels are mixed pixels on the ramp between a foreground edge and
+    the background; the Orbbec's SW alignment (640x576 native depth -> 1280x960
+    color grid) additionally interpolates across those discontinuities, smearing
+    the ramp over 2-3 aligned pixels. In a point cloud they show up as streaks of
+    3D points floating between the object and the background. A single
+    adjacent-pixel diff can stay under threshold on every step of such a ramp, so
+    we threshold the *windowed* range instead: max(z) - min(z) over a ``ksize`` x
+    ``ksize`` neighborhood (morphological dilate/erode), computed only over valid
+    (finite, >0) pixels so dropout regions neither trip the filter nor kill their
+    valid neighbors.
+
+    This flags the whole ramp plus ~1 px of legitimate edge on each side. A
+    ``thresh`` of ~30 mm keeps steeply slanted real surfaces (an 80-degree-
+    incidence surface at 0.7 m spans ~14 mm across a 3x3 window at Orbbec
+    aligned resolution) while cutting fg/bg edge ramps, typically >100 mm.
+
+    Args:
+        z: (H, W) z-depth grid, any units; <=0 or non-finite = invalid.
+        thresh: local-range threshold in the same units as ``z``.
+    Returns:
+        (H, W) bool; True where a valid pixel should be discarded. Invalid
+        pixels are always False (they are already excluded downstream).
+    """
+    import cv2
+    d = np.asarray(z, np.float32)
+    valid = np.isfinite(d) & (d > 0)
+    kernel = np.ones((ksize, ksize), np.uint8)
+    # Sentinels exclude invalid pixels from the window max/min.
+    hi = cv2.dilate(np.where(valid, d, np.float32(-1.0)), kernel)
+    lo = cv2.erode(np.where(valid, d, np.float32(np.finfo(np.float32).max)), kernel)
+    return valid & ((hi - lo) > thresh)
+
+
 def backproject(depth: np.ndarray, K: np.ndarray, depth_scale: float = 1000.0):
     """Backproject a depth image to camera-frame points.
 
@@ -88,10 +124,12 @@ def budget_sample(points: np.ndarray, labels: np.ndarray, budget: dict,
                   pad: str = "repeat", rng: Optional[np.random.Generator] = None):
     """Sample a fixed per-class number of points.
 
-    For each ``label -> target`` in ``budget``: random-sample ``target`` of that class.
-    If fewer than ``target`` are available, ``pad`` controls the fill:
-      * "repeat" -- sample with replacement to reach target (keeps N fixed; recommended)
-      * "short"  -- emit only what's available (N may be < sum(budget))
+    For each ``label -> target`` in ``budget``: draw ``target`` points of that class
+    uniformly WITH replacement (i.i.d.), matching the sim training distribution. This
+    holds whether or not the class has >= target points available.
+    ``pad`` only matters when fewer than ``target`` are available:
+      * "repeat" -- keep sampling with replacement to reach target (keeps N fixed; recommended)
+      * "short"  -- emit only what's available, unrepeated (N may be < sum(budget))
     Returns (coords (N,3), labels (N,), per_available dict, short_list).
     """
     rng = rng or np.random.default_rng()
@@ -101,15 +139,21 @@ def budget_sample(points: np.ndarray, labels: np.ndarray, budget: dict,
         available[label] = int(sel.size)
         if sel.size == 0:
             short.append(label)
+            # Fully occluded class: emit its full budget as zero points (xyz=0, class label kept)
+            # so the cloud stays a fixed size (sum(budget)) with the same per-class proportions,
+            # instead of returning a smaller cloud the policy/accumulator can't ingest.
+            out_pts.append(np.zeros((target, 3), np.float32))
+            out_lab.append(np.full(target, label, np.float32))
             continue
-        if sel.size >= target:
-            pick = rng.choice(sel, size=target, replace=False)
-        elif pad == "repeat":
-            pick = rng.choice(sel, size=target, replace=True)
-            short.append(label)
-        else:  # "short"
+        if pad == "short" and sel.size < target:
             pick = sel
             short.append(label)
+        else:
+            # Always sample WITH replacement to match the sim training distribution
+            # (each of `target` points drawn i.i.d. from this class's available points).
+            pick = rng.choice(sel, size=target, replace=True)
+            if sel.size < target:
+                short.append(label)
         out_pts.append(points[pick])
         out_lab.append(np.full(pick.shape[0], label, np.float32))
     coords = np.concatenate(out_pts, axis=0) if out_pts else np.zeros((0, 3), np.float32)
@@ -234,15 +278,21 @@ def budget_sample_torch(points, labels, budget: dict, pad: str = "repeat", gener
         available[label] = n
         if n == 0:
             short.append(label)
+            # Fully occluded class: emit its full budget as zero points (xyz=0, class label kept)
+            # so the cloud stays a fixed size (sum(budget)) with the same per-class proportions,
+            # instead of returning a smaller cloud the policy/accumulator can't ingest.
+            out_pts.append(torch.zeros((target, 3), dtype=torch.float32, device=dev))
+            out_lab.append(torch.full((target,), float(label), dtype=torch.float32, device=dev))
             continue
-        if n >= target:
-            pick = sel[torch.randperm(n, device=dev, generator=generator)[:target]]
-        elif pad == "repeat":
-            pick = sel[torch.randint(0, n, (target,), device=dev, generator=generator)]
-            short.append(label)
-        else:  # "short"
+        if pad == "short" and n < target:
             pick = sel
             short.append(label)
+        else:
+            # Always sample WITH replacement to match the sim training distribution
+            # (each of `target` points drawn i.i.d. from this class's available points).
+            pick = sel[torch.randint(0, n, (target,), device=dev, generator=generator)]
+            if n < target:
+                short.append(label)
         out_pts.append(points[pick])
         out_lab.append(torch.full((pick.numel(),), float(label), dtype=torch.float32, device=dev))
     coords = torch.cat(out_pts, 0) if out_pts else torch.zeros((0, 3), dtype=torch.float32, device=dev)
@@ -250,31 +300,33 @@ def budget_sample_torch(points, labels, budget: dict, pad: str = "repeat", gener
     return coords.to(torch.float32), labs, available, short
 
 
-def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
-                      depth_scale: float = 1000.0, crop_lo=None, crop_hi=None,
-                      budget: Optional[dict] = None, pad: str = "repeat", generator=None):
-    """On-device twin of ``build_cloud``: depth tensor (+ label_map tensor) -> (cloud (N,4)
-    float32 tensor, CloudStats). bbox stats are pulled to host (small); the cloud stays on-device."""
+def assemble_cloud_torch(pts_cam, labels, T_cam_base, ee_pos, ee_quat_wxyz, label_mode=True,
+                         crop_lo=None, crop_hi=None, budget: Optional[dict] = None,
+                         pad: str = "repeat", generator=None):
+    """Shared tail of the on-device cloud build: camera-frame points (+ per-point labels) ->
+    base -> EE frame -> crop -> per-class budget -> (cloud (N,4), CloudStats).
+
+    Factored out so both the depth-backprojection path (``build_cloud_torch``) and a sensor that
+    emits points directly (e.g. Orbbec's ``PointCloudFilter``) feed the SAME transform/crop/budget
+    logic. ``pts_cam`` is (M,3) in the camera optical frame; ``labels`` is (M,) with SEG_LABELS
+    values and ``NaN`` for background. ``label_mode=False`` keeps every point with label 0.0 and
+    skips budgeting (geometry-only debug)."""
     import torch
     stats = CloudStats()
-    pts_cam, pix_idx = backproject_torch(depth, K, depth_scale)
-    stats.n_raw_valid = int(pix_idx.numel())
+    stats.n_raw_valid = int(pts_cam.shape[0])
 
     pts_base = transform_points_torch(pts_cam, T_cam_base)
     pts_ee = to_ee_frame_torch(pts_base, ee_pos, ee_quat_wxyz)
 
-    if label_map is not None:
-        labels = label_map.reshape(-1)[pix_idx]
-        keep = torch.isfinite(labels)  # drop background pixels
+    if label_mode:
+        keep = torch.isfinite(labels)  # drop background points
         pts_ee, labels = pts_ee[keep], labels[keep]
-    else:
-        labels = torch.zeros(pts_ee.shape[0], dtype=torch.float32, device=pts_ee.device)
 
     if crop_lo is not None and crop_hi is not None:
         pts_ee, labels = crop_aabb_torch(pts_ee, crop_lo, crop_hi, labels)
     stats.n_after_crop = int(pts_ee.shape[0])
 
-    if label_map is None:
+    if not label_mode:
         coords, labs = pts_ee.to(torch.float32), labels
         stats.per_class_available = {0.0: int(coords.shape[0])}
         stats.per_class_realized = {0.0: int(coords.shape[0])}
@@ -290,3 +342,19 @@ def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None
         stats.bbox_max = coords.max(0).values.detach().cpu().numpy()
     cloud = torch.cat([coords, labs[:, None]], dim=1).to(torch.float32)
     return cloud, stats
+
+
+def build_cloud_torch(depth, K, T_cam_base, ee_pos, ee_quat_wxyz, label_map=None,
+                      depth_scale: float = 1000.0, crop_lo=None, crop_hi=None,
+                      budget: Optional[dict] = None, pad: str = "repeat", generator=None):
+    """On-device twin of ``build_cloud``: depth tensor (+ label_map tensor) -> (cloud (N,4)
+    float32 tensor, CloudStats). bbox stats are pulled to host (small); the cloud stays on-device."""
+    import torch
+    pts_cam, pix_idx = backproject_torch(depth, K, depth_scale)
+    if label_map is not None:
+        labels = label_map.reshape(-1)[pix_idx]
+    else:
+        labels = torch.zeros(pts_cam.shape[0], dtype=torch.float32, device=pts_cam.device)
+    return assemble_cloud_torch(
+        pts_cam, labels, T_cam_base, ee_pos, ee_quat_wxyz, label_mode=(label_map is not None),
+        crop_lo=crop_lo, crop_hi=crop_hi, budget=budget, pad=pad, generator=generator)

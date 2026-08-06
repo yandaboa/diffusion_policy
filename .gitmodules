@@ -5,3 +5,6 @@
 	path = Fast-FoundationStereo
 	url = git@github.com:yandaboa/Fast-FoundationStereo.git
 	branch = real
+[submodule "FoundationPose"]
+	path = FoundationPose
+	url = git@github.com:kushal2000/FoundationPose.git

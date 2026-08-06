@@ -7,20 +7,27 @@ obs the sim wrapper produced at training time:
 
   proprio:   (1, num_proprio) float32  — concat of history-flattened
              [prev_actions, joint_pos, end_effector_pose] (history_length=5)
-  side_depth, wrist_depth: (1, 1, 224, 224) float32 in [0,1], clipped at
-             ``DEPTH_CLIP = (0.01, 2.0)`` m, with no-return pixels mapped to d_max.
-             RealSense u16 + DA3METRIC fusion mirrors ``demo_real_robot.py``.
+  side_depth, front_depth: (1, 1, 224, 224) float32 in [0,1], clipped at
+             ``DEPTH_CLIP = (0.01, 1.0)`` m (sim2real_depth_cfg.py:83), with
+             no-return pixels mapped to d_max. Both cameras are natively 4:3 and
+             are squashed to 224x224, exactly as sim squashes its 320x240 render.
+
+Cameras (raw sensor depth — no DA3 fusion):
+  side  — RealSense D435, enumerated by RealEnv/MultiRealsense (camera_idx 0).
+  front — Orbbec Femto Bolt, read on a background thread (RealEnv's camera
+          plumbing is RealSense-only, so the Orbbec is opened separately here).
+
+Runs in the ``foundstereo`` env, not ``robodiff_real``: the Orbbec needs
+``pyorbbecsdk``, which only foundstereo has (same env as eval_real_robot_pc.py).
 
 Usage:
-(robodiff_real)$ python eval_real_robot_depth.py -i <depth_policy_jit> -o <save_dir> --robot_ip <ip>
-
-================ Human in control ==============
-Move the SpaceMouse to position the robot. Press "C" to hand control to the
-policy, "Q" to exit.
+(foundstereo)$ python eval_real_robot_depth.py -i <depth_policy_jit> -o <save_dir> --robot_ip <ip>
 
 ================ Policy in control ==============
-Press "S" to stop, "R" to reset robot to initial joints, "G" to force the
-gripper open for a few steps (also auto-triggered after 2 s of no motion).
+The policy drives from the moment an episode starts; there is no SpaceMouse
+teleop stage in this script. Press "S" to stop, "R" to reset the robot to its
+initial joints, "G" to force the gripper open for a few steps (also
+auto-triggered after 2 s of no motion).
 """
 
 # %%
@@ -39,32 +46,61 @@ import numpy as np
 import torch
 import json
 import pathlib
-import skvideo.io
 from diffusion_policy.real_world.real_env import RealEnv
-from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
 from diffusion_policy.common.precise_sleep import precise_wait
-from diffusion_policy.real_world.da3_depth_client import DA3DepthClient, DA3DepthBackground
+
+# The Orbbec backend we need lives at scripts/sim2real/perception/orbbec.py, but a
+# plain ``import orbbec`` would resolve to the top-level ``orbbec/`` package instead
+# (different API — that one yields point clouds, not depth images). Load it by path
+# under a distinct module name to sidestep the collision.
+import importlib.util as _ilu
+_ORBBEC_PATH = pathlib.Path(__file__).parent / 'scripts' / 'sim2real' / 'perception' / 'orbbec.py'
+_spec = _ilu.spec_from_file_location('_perception_orbbec', _ORBBEC_PATH)
+_perception_orbbec = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_perception_orbbec)
+gather_orbbec_cameras = _perception_orbbec.gather_orbbec_cameras
 
 # Add imageio import for video saving
 import imageio
-from scipy.spatial.transform import Rotation as R
 
 # Calibrated FK matching simulation (wrist_3_link in REP-103 base_link frame)
 from diffusion_policy.real_world.ur5e_kinematics import get_ee_pose, quat_to_axis_angle, apply_delta_pose
 
-# ── Depth constants matching depth_dagger_cfg.py ───────────────────────────
-DEPTH_CLIP = (0.01, 2.0)            # metres, must match sim's DEPTH_CLIP
-DEPTH_IMG_H, DEPTH_IMG_W = 224, 224 # must match sim's IMG_H, IMG_W
+# ── Depth constants — must match sim2real_depth_cfg.py (the SideFront task) ──
+# DEPTH_CLIP is verbatim from sim2real_depth_cfg.py:83. Both the clip bounds and
+# the normalisation scale matter: sim maps depth as (d - d_lo) / (d_hi - d_lo),
+# so a different d_lo shifts every pixel the policy sees.
+DEPTH_CLIP = (0.01, 1.0)            # metres — sim2real_depth_cfg.py:83
+DEPTH_IMG_H, DEPTH_IMG_W = 224, 224 # sim's IMG_H, IMG_W (sim2real_depth_cfg.py:79)
 
-# ── Camera serials must match the order RealEnv enumerates them ─────────────
-# (camera_idx 0 = front, 1 = side, 2 = wrist in real_env.get_obs).
-FRONT_SERIAL = '215122255213'
-SIDE_SERIAL  = '832112070487'
-WRIST_SERIAL = '746112060198'
+# Sim renders depth at 4:3 (RENDER_H, RENDER_W = 240, 320) and resizes to 224x224,
+# i.e. it squashes 4:3 → 1:1 rather than cropping. Both real cameras are natively
+# 4:3 (D435 640x480, Orbbec 1280x960), so resizing them straight to 224x224
+# reproduces the same anisotropic squash. Do NOT centre-crop to square here.
+
+# ── Cameras ────────────────────────────────────────────────────────────────
+# The D435 side camera is the only RealSense enumerated, so MultiRealsense
+# assigns it camera_idx 0. RealEnv's positional name table (real_env.get_obs)
+# maps idx 0 → 'side_rgb' for a <3-camera setup, which is what we want.
+# The front view comes from the Orbbec, which RealEnv cannot enumerate.
+SIDE_SERIAL = '832112070487'        # RealSense D435 (side)
+SIDE_CAM_IDX = 0
+
+# Orbbec depth is uint16 millimetres (see scripts/sim2real/perception/orbbec.py),
+# so the same u16→metres path as RealSense applies with a 1e-3 scale.
+ORBBEC_DEPTH_SCALE = 0.001
 
 # ── Proprio layout (must match DepthDAggerObservationsCfg.ProprioCfg) ───────
 # Per-frame: prev_actions (7) + joint_pos (12) + end_effector_pose (6) = 25
 # History length 5, terms concatenated: 5*7 + 5*12 + 5*6 = 125 dims total.
+# --proprio_mode slim drops prev_actions and the 6 synthetic mimic gripper
+# joints (which are reconstructed, not measured): 5*6 + 5*6 = 60 dims. Term
+# ordering is otherwise unchanged (joint_pos frames, then ee_pose frames).
+# --proprio_mode slim_gripper is `slim` plus a 1-d measured gripper close
+# fraction (0=open, 1=closed) appended after ee_pose — the real counterpart of
+# sim's task_mdp.gripper_close_progress term in the ...-ArmProprio-GripperAux-v0
+# task (ProprioArmGripperProgressCfg). Layout: 5*6 (arm) + 5*6 (ee) + 5*1
+# (gripper) = 65 dims, matching that cfg's per-term history-flattened order.
 HISTORY_LEN = 5
 PREV_ACTION_DIM = 7  # 6 OSC delta + 1 gripper
 EE_POSE_DIM = 6      # 3 pos + 3 axis-angle
@@ -125,6 +161,13 @@ class _KeyReader:
     def start(self) -> '_KeyReader':
         self._old_settings = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)   # char-by-char input; keeps Ctrl+C working
+        # cbreak disables ECHO. If the process dies before stop() runs — e.g. a
+        # Ctrl+C KeyboardInterrupt, which is a BaseException and so slips past the
+        # loop's `except Exception` — the terminal is left with echo off and typed
+        # input stops showing. Register the restore with atexit so it fires on any
+        # exit path (normal, exception, or interrupt); stop() is idempotent.
+        import atexit
+        atexit.register(self.stop)
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name='_KeyReader')
@@ -158,74 +201,273 @@ class _KeyReader:
             return -1
 
 
-def _process_realsense_depth(depth_u16: np.ndarray, depth_scale: float) -> np.ndarray:
-    """Raw u16 RealSense depth → policy-input float32 [0,1] @ 224×224.
+class OrbbecDepthBackground:
+    """Continuously grab RGB+depth from the Orbbec on a background thread.
 
-    Mirrors sim's ``process_image`` for ``data_type='distance_to_camera'``:
-      1. Convert u16 → metres via ``depth_scale`` (m/unit from sensor).
-      2. Map zero-pixels (no return) → ``d_max`` so they read as far range,
-         matching the sim path which sets nan/inf → d_max via ``nan_to_num``.
-      3. Clip to ``DEPTH_CLIP`` and normalise to [0, 1].
-      4. Bilinear resize to 224×224 (sim uses bilinear+antialias on GPU; cv2
-         INTER_LINEAR is the closest CPU equivalent).
+    ``OrbbecCamera.read_camera()`` blocks on ``wait_for_frames(500)`` and raises
+    after a retry budget, so calling it inline would stall (or kill) the 10 Hz
+    control loop on a dropped frame. This thread keeps only the newest frame;
+    the loop reads it without blocking, tolerating a slightly stale depth map
+    the same way the DA3 background thread did.
+
+    Use as a context manager. ``__exit__`` must run: destroying a still-streaming
+    pyorbbecsdk pipeline aborts the process in C++ ("terminate called without an
+    active exception"), which would otherwise mask any real Python traceback.
+    """
+
+    def __init__(self, camera=None) -> None:
+        self._cam = camera
+        self._lock = threading.Lock()
+        self._latest: tuple[np.ndarray, np.ndarray, float] | None = None
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._n_errors = 0
+
+    def __enter__(self) -> 'OrbbecDepthBackground':
+        if self._cam is None:
+            print('Opening Orbbec front camera...')
+            cams = gather_orbbec_cameras(rgb=True, depth=True, align='rgb')
+            if len(cams) == 0:
+                raise RuntimeError('No Orbbec camera found — front_depth is unavailable.')
+            if len(cams) > 1:
+                print(f'[WARN] {len(cams)} Orbbec devices found; using serial '
+                      f'{cams[0]._serial_number}.')
+            self._cam = cams[0]
+        self.start()
+        try:
+            self.wait_first_frame(timeout=20.0)
+        except Exception:
+            self.stop()
+            raise
+        rgb, depth, _ = self.get_latest()
+        print(f'Orbbec ready — rgb {rgb.shape}, depth {depth.shape} {depth.dtype} (mm)')
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.stop()
+
+    def start(self) -> 'OrbbecDepthBackground':
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name='OrbbecDepthBackground')
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Idempotent — may be reached from both the error path and __exit__."""
+        if self._cam is None:
+            return
+        self._stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        try:
+            self._cam.disable_camera()
+        except Exception as e:
+            print(f'[Orbbec] disable_camera failed: {e}')
+        self._cam = None
+
+    def _run(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                frame = self._cam.read_camera()
+            except Exception as e:
+                # Transient dropout: keep serving the last good frame rather than
+                # taking down the control loop.
+                self._n_errors += 1
+                if self._n_errors % 10 == 1:
+                    print(f'[Orbbec] read_camera failed ({self._n_errors}x): {e}')
+                continue
+            with self._lock:
+                # capture_time = SDK's true capture stamp on the host clock
+                # (global-timestamp fitter, else SDK receive time); read_time —
+                # stamped after align+copy — only remains as a legacy fallback.
+                self._latest = (frame['rgb'], frame['depth'],
+                                frame.get('capture_time', frame['read_time']))
+
+    def get_latest(self) -> 'tuple[np.ndarray, np.ndarray, float] | None':
+        """Return (rgb HxWx3 uint8, depth HxW uint16 mm, capture_time) or None."""
+        with self._lock:
+            return self._latest
+
+    def wait_first_frame(self, timeout: float = 20.0) -> None:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if self.get_latest() is not None:
+                return
+            time.sleep(0.05)
+        raise RuntimeError(f'Orbbec produced no frame within {timeout:.0f}s')
+
+
+def _last_scalar(arr) -> float:
+    """Most recent value of a per-timestep obs field, as a Python float.
+
+    ``get_obs()`` returns ``gripper_pos`` shaped (T, 1) (real_env builds it as
+    ``np.asarray([gripper_pos_raw])`` per step), so ``arr[-1]`` is a shape-(1,)
+    array, not a scalar. NumPy 2 refuses ``float()`` on that ("only 0-dimensional
+    arrays can be converted to Python scalars") where NumPy 1.x allowed it — and
+    this script runs on NumPy 2 in foundstereo. Flatten first, matching the idiom
+    real_env itself uses. Handles (T,) and (T, 1) alike.
+    """
+    return float(np.asarray(arr).reshape(-1)[-1])
+
+
+def _preflight_realsense(env, n_obs_steps: int, timeout: float = 15.0) -> None:
+    """Fail fast, and legibly, if a RealSense isn't delivering frames.
+
+    Without this, a camera that streams no frames surfaces much later as a bare
+    ``AssertionError`` from ``shared_memory_ring_buffer.get_last_k`` (asserting
+    ``k <= count`` against an empty buffer), which says nothing about the cause.
+
+    The usual cause is a wedged D435: an unclean exit (e.g. a core dump) leaves
+    the device unable to stream, and its capture process dies with "Frame didn't
+    arrive within 5000". A hardware reset clears it — see the message below.
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        dead = [s for s, c in env.realsense.cameras.items() if not c.is_alive()]
+        if dead:
+            raise RuntimeError(
+                f"RealSense capture process for {dead} has died — it is not "
+                f"streaming (look for \"Frame didn't arrive within 5000\" above).\n"
+                f"    The camera is usually wedged after an unclean exit. Reset it:\n"
+                f"      python -c \"import pyrealsense2 as rs; [d.hardware_reset() "
+                f"for d in rs.context().query_devices()]\"; sleep 8\n"
+                f"    Then re-run. Replugging the USB cable also works."
+            )
+        try:
+            env.realsense.get(k=n_obs_steps)
+            print(f'RealSense preflight OK — {n_obs_steps} frames buffered.')
+            return
+        except AssertionError:
+            time.sleep(0.5)   # buffer still filling
+    raise RuntimeError(
+        f"RealSense buffered fewer than {n_obs_steps} frames in {timeout:.0f}s. "
+        f"The camera is alive but slow or stalling; try the hardware reset above."
+    )
+
+
+def _resize_like_sim(depth_norm: np.ndarray) -> np.ndarray:
+    """Resize normalised depth to 224×224 using sim's exact resampling op.
+
+    Sim (``depth_augs.py`` line ~112) ends with::
+
+        img = F.interpolate(img, size=output_size, mode="bilinear", antialias=True)
+
+    so we call the identical torch op rather than approximate it with cv2.
+    ``antialias=True`` is the load-bearing part — it low-pass filters before
+    decimating. cv2.INTER_LINEAR does not, and we downscale far harder than sim
+    (Orbbec 1280×960→224² is 5.7×, vs sim's 320×240→224² at 1.4×), so plain
+    bilinear would hand the policy aliased high-frequency structure that never
+    existed in training (measured: MAE 0.10 and std 0.21 vs sim's 0.14).
+
+    Runs on CPU: ~0.2 ms at these sizes, and it keeps this helper usable from the
+    visualisation path without touching the GPU.
+    """
+    t = torch.from_numpy(np.ascontiguousarray(depth_norm, dtype=np.float32))[None, None]
+    t = torch.nn.functional.interpolate(
+        t, size=(DEPTH_IMG_H, DEPTH_IMG_W), mode='bilinear', antialias=True)
+    return t[0, 0].numpy()
+
+
+def _process_u16_depth(depth_u16: np.ndarray, depth_scale: float) -> np.ndarray:
+    """Raw u16 sensor depth → policy-input float32 [0,1] @ 224×224.
+
+    Serves both cameras: RealSense z16 (``depth_scale`` from the sensor) and the
+    Orbbec, whose depth is u16 millimetres (``ORBBEC_DEPTH_SCALE = 1e-3``). Both
+    use 0 to mean "no return".
+
+    Mirrors sim's ``dextrah_depth_image`` (mdp/depth_augs.py:360), which reads
+    ``data_type='distance_to_image_plane'`` — z-depth, i.e. what a real RealSense
+    or Orbbec reports — and then:
+      1. Convert u16 → metres via ``depth_scale`` (m/unit).
+      2. Map zero-pixels (no return) → ``d_max`` so they read as far range. Sim
+         does the same: ``no_return = ~isfinite | (depth <= 0)`` is pinned to
+         ``d_hi`` so missing pixels normalise to 1.0 (flat far).
+      3. Clip to ``DEPTH_CLIP`` and normalise: ``(d - d_lo) / (d_hi - d_lo)``.
+      4. Resize to 224×224 with ``_resize_like_sim`` — bilinear **with antialias**,
+         the same op sim applies. Not cv2.INTER_LINEAR: that does no antialiasing
+         when downscaling, and we shrink much harder than sim does (Orbbec 5.7×
+         vs sim's 1.4×), which leaves aliasing sim never produced.
+
+    Sim's augmentations (noise, dropout, sticks, corner crops, stereo shadow) are
+    training-time only and deliberately not reproduced — they model the real
+    sensor artefacts we already get for free.
+
+    ``float(depth_scale)`` is load-bearing, not cosmetic. ``get_depth_scale()``
+    returns a **np.float64** (its shm intrinsics_array is float64), and under
+    NumPy 2's NEP 50 a NumPy scalar takes part in promotion: float32 * np.float64
+    → float64, which reaches the policy as a DoubleTensor and raises "Input type
+    (torch.cuda.DoubleTensor) and weight type (torch.cuda.FloatTensor) should be
+    the same". NumPy 1.x kept it float32 via value-based casting, so this only
+    bites on the NumPy 2 in foundstereo. Demoting to a Python float keeps the
+    scalar "weak" and the result float32.
     """
     d_min, d_max = DEPTH_CLIP
-    depth_m = depth_u16.astype(np.float32) * depth_scale
+    depth_m = depth_u16.astype(np.float32) * float(depth_scale)
     depth_m[depth_m == 0.0] = d_max
     np.clip(depth_m, d_min, d_max, out=depth_m)
     depth_norm = (depth_m - d_min) / (d_max - d_min)
-    return cv2.resize(depth_norm, (DEPTH_IMG_W, DEPTH_IMG_H), interpolation=cv2.INTER_LINEAR)
+    out = _resize_like_sim(depth_norm)
+    # Contract: the policy's conv weights are float32. Assert it rather than trust it.
+    return out.astype(np.float32, copy=False)
 
 
-def _process_metric_depth(depth_m: np.ndarray) -> np.ndarray:
-    """DA3-fused metric depth (float32 metres) → policy-input float32 [0,1] @ 224×224.
+def _side_capture_time(cam_data) -> float:
+    """True capture time of the newest side frame, as host epoch seconds.
 
-    Same clip+normalise+resize as ``_process_realsense_depth`` but the input
-    is already metric float (no u16 → m conversion). DA3 fills holes during
-    fusion, so zero-as-no-return handling is unnecessary; we still nan-guard
-    in case fusion returned nan/inf.
+    Uses ``camera_capture_timestamp`` — librealsense's per-frame stamp, which with
+    global time enabled (default on D400) is the sensor capture time mapped onto
+    the host clock. Validated against the host receive time: if global time is
+    off, the stamp is in the camera's hardware-clock domain (device uptime) and
+    lands far from receive_time, in which case we fall back to receive_time and
+    warn once.
     """
-    d_min, d_max = DEPTH_CLIP
-    depth_m = np.nan_to_num(depth_m, nan=d_max, posinf=d_max, neginf=d_max)
-    depth_m = np.clip(depth_m, d_min, d_max)
-    depth_norm = (depth_m - d_min) / (d_max - d_min)
-    return cv2.resize(depth_norm, (DEPTH_IMG_W, DEPTH_IMG_H), interpolation=cv2.INTER_LINEAR)
+    recv = float(cam_data['timestamp'][-1])
+    cap_arr = cam_data.get('camera_capture_timestamp')
+    if cap_arr is not None:
+        cap = float(cap_arr[-1])
+        if abs(cap - recv) < 1.0:
+            return cap
+    if not getattr(_side_capture_time, '_warned', False):
+        _side_capture_time._warned = True
+        print("[WARN] RealSense camera_capture_timestamp is not in the host clock "
+              "domain (global time disabled?); side latency falls back to SDK "
+              "receive time and will understate the true frame age.")
+    return recv
+
+
+def _build_depth_obs(env, orbbec_bg, side_depth_scale):
+    """Current (side_norm, front_norm, front_rgb, side_ts, front_ts) — the policy's depth inputs.
+
+    Shared by the warmup and the control loop so both provably exercise the same
+    dtype/shape path; the warmup previously used zeros and so caught neither.
+
+    side_ts / front_ts are best-effort TRUE capture times on the host clock:
+    the RealSense global-time frame stamp and the Orbbec global-timestamp-fitter
+    stamp. Each degrades to its SDK receive time (with a one-time warning /
+    source log) when the device stamp isn't host-clock comparable.
+    """
+    if env.last_realsense_data is None:
+        raise RuntimeError("No realsense data yet — was RealEnv started with enable_depth=True?")
+    rs_side = env.last_realsense_data[SIDE_CAM_IDX].get('depth')
+    if rs_side is None:
+        raise RuntimeError("Depth frames missing from realsense buffer.")
+    side_ts = _side_capture_time(env.last_realsense_data[SIDE_CAM_IDX])
+
+    frame = orbbec_bg.get_latest()
+    if frame is None:
+        raise RuntimeError("Orbbec produced no frame — front_depth unavailable.")
+    front_rgb, front_depth_u16, front_ts = frame
+
+    side_norm  = _process_u16_depth(rs_side[-1], side_depth_scale)
+    front_norm = _process_u16_depth(front_depth_u16, ORBBEC_DEPTH_SCALE)
+    return side_norm, front_norm, front_rgb, side_ts, front_ts
 
 
 def _depth_to_bgr(depth_norm: np.ndarray) -> np.ndarray:
     """float32 [0,1] → BGR uint8 via TURBO colormap (matches demo_real_robot.py)."""
     return cv2.applyColorMap((depth_norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-
-
-def _metric_to_bgr(depth_m: np.ndarray, out_wh: tuple[int, int]) -> np.ndarray:
-    """float32 metric depth (metres) → BGR uint8 via TURBO, resized to out_wh (W, H)."""
-    d_min, d_max = DEPTH_CLIP
-    depth = np.nan_to_num(depth_m, nan=d_max, posinf=d_max, neginf=d_max).astype(np.float32)
-    depth = np.clip(depth, d_min, d_max)
-    norm = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-    if norm.shape[:2][::-1] != out_wh:
-        norm = cv2.resize(norm, out_wh, interpolation=cv2.INTER_LINEAR)
-    return cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
-
-
-def _ee_to_w2c(pos: np.ndarray, quat_wxyz: np.ndarray,
-               cam_in_ee: np.ndarray) -> np.ndarray:
-    """Compute world-to-camera 4×4 from FK output + camera-in-wrist offset.
-
-    Args:
-        pos:        (3,) wrist_3_link position in base frame.
-        quat_wxyz:  (4,) quaternion [w, x, y, z] from get_ee_pose().
-        cam_in_ee:  (4, 4) camera-to-wrist_3_link transform (calibration file).
-
-    Returns: (4, 4) world-to-camera matrix, float64.
-    """
-    w, x, y, z = quat_wxyz
-    R_ee = R.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
-    T_ee = np.eye(4, dtype=np.float64)
-    T_ee[:3, :3] = R_ee
-    T_ee[:3,  3] = pos
-    T_cam = T_ee @ cam_in_ee          # camera-in-world
-    return np.linalg.inv(T_cam)       # world-to-camera
 
 
 def compute_calibrated_ee_pose(joint_positions: np.ndarray) -> np.ndarray:
@@ -246,45 +488,107 @@ def compute_calibrated_ee_pose(joint_positions: np.ndarray) -> np.ndarray:
     return ee_poses
 
 
-def _build_joint_pos(arm_joint_pos: np.ndarray, gripper_pos_raw: float) -> np.ndarray:
+def _build_joint_pos(arm_joint_pos: np.ndarray, gripper_pos_raw: float,
+                     include_gripper: bool = True) -> np.ndarray:
     """Reconstruct the 12-dim sim joint_pos from real-robot scalars.
 
     Args:
         arm_joint_pos: (6,) UR5e joint angles (rad).
         gripper_pos_raw: normalized gripper position in [0, 1] (0=open, 1=closed),
             as returned by RTDEInterpolationController using calibrated open/close positions.
+        include_gripper: when False (--proprio_mode slim), skip the 6 synthetic
+            mimic gripper joints and return only the (6,) arm joints.
     Returns: (12,) float32 in the order Isaac Lab returns
         ``asset.data.joint_pos`` for EXPLICIT_UR5E_ROBOTIQ_2F85
         (arm joints first, then 6 gripper joints driven by mimic).
     """
+    if not include_gripper:
+        return arm_joint_pos.astype(np.float32)
     master_angle = (float(gripper_pos_raw) - GRIPPER_POS_OPEN) * GRIPPER_POS_TO_RAD
     gripper_joints = (GRIPPER_MIMIC_RATIOS * master_angle).astype(np.float32)
     return np.concatenate([arm_joint_pos.astype(np.float32), gripper_joints], axis=0)
 
 
-def _build_proprio_tensor(history, device) -> torch.Tensor:
+def _gripper_close_progress(gripper_pos_raw: float) -> np.ndarray:
+    """Measured gripper close fraction (0=open, 1=closed) as a (1,) float32.
+
+    Real counterpart of sim's ``task_mdp.gripper_close_progress`` (the extra
+    proprio term the ...-ArmProprio-GripperAux-v0 task appends): sim normalises
+    the Robotiq ``finger_joint`` angle over its command range
+    ``(pos - open_pos) / (close_pos - open_pos)`` and ``clamp(0, 1)``.
+
+    ``obs['gripper_pos']`` (``gripper_pos_raw``) is ALREADY that fraction, using
+    the *calibrated* open/close values: the RTDE controller fetches them from the
+    gripper API after activation (``gripper.get_open_position()`` /
+    ``get_closed_position()``) and normalises the measured position as
+    ``(raw - open) / (close - open)`` — see rtde_interpolation_controller.py:326
+    and :385. So here we only clamp to [0, 1], matching sim's ``clamp``. Do NOT
+    re-normalise: the calibration is already applied upstream, and doing it again
+    would double-count it.
+    """
+    return np.array([np.clip(float(gripper_pos_raw), 0.0, 1.0)], dtype=np.float32)
+
+
+def _build_proprio_tensor(history, device, include_prev_action: bool = True,
+                          include_gripper_progress: bool = False) -> torch.Tensor:
     """Stack the per-frame history into the policy's proprio input.
 
     Args:
-        history: deque of dicts {prev_action: (7,), joint_pos: (12,), ee_pose: (6,)},
-            oldest-first. Pads short histories by repeating the earliest frame
-            (matches Isaac Lab's CircularBuffer, which back-fills with the first
-            observation seen at startup).
+        history: deque of dicts {prev_action: (7,), joint_pos: (12,), ee_pose: (6,),
+            gripper_progress: (1,)}, oldest-first. Pads short histories by
+            repeating the earliest frame (matches Isaac Lab's CircularBuffer,
+            which back-fills with the first observation seen at startup).
+        include_prev_action: when False (--proprio_mode slim / slim_gripper), the
+            prev_action term is omitted entirely; the remaining terms keep order.
+        include_gripper_progress: when True (--proprio_mode slim_gripper), append
+            the measured gripper close fraction term after ee_pose, matching sim's
+            ProprioArmGripperProgressCfg (gripper_close_progress last).
 
-    Returns: (1, 5*7 + 5*12 + 5*6) = (1, 125) tensor on ``device``.
+    Returns: (1, 5*7 + 5*12 + 5*6) = (1, 125) tensor on ``device``
+    (full mode; slim is (1, 5*6 + 5*6) = (1, 60); slim_gripper is
+    (1, 5*6 + 5*6 + 5*1) = (1, 65)).
     Layout (matches Isaac Lab ObservationManager with concatenate_terms=True
     and flatten_history_dim=True): all 5 prev_action frames flat, then all 5
-    joint_pos frames flat, then all 5 ee_pose frames flat.
+    joint_pos frames flat, then all 5 ee_pose frames flat, then (slim_gripper)
+    all 5 gripper_progress frames flat.
     """
     if len(history) == 0:
         raise ValueError("Empty proprio history")
     while len(history) < HISTORY_LEN:
         history.appendleft(history[0])
-    prev_actions = np.concatenate([h["prev_action"] for h in history], axis=0)
-    joint_pos    = np.concatenate([h["joint_pos"]    for h in history], axis=0)
-    ee_pose      = np.concatenate([h["ee_pose"]      for h in history], axis=0)
-    flat = np.concatenate([prev_actions, joint_pos, ee_pose], axis=0).astype(np.float32)
+    terms = []
+    if include_prev_action:
+        terms.append(np.concatenate([h["prev_action"] for h in history], axis=0))
+    terms.append(np.concatenate([h["joint_pos"] for h in history], axis=0))
+    terms.append(np.concatenate([h["ee_pose"]   for h in history], axis=0))
+    if include_gripper_progress:
+        terms.append(np.concatenate([h["gripper_progress"] for h in history], axis=0))
+    flat = np.concatenate(terms, axis=0).astype(np.float32)
     return torch.from_numpy(flat).unsqueeze(0).to(device)
+
+
+def _stack_view(history: deque, frame_t: torch.Tensor, n_frames: int) -> torch.Tensor:
+    """Append one single-frame view tensor (1, C, H, W) to its history and return the policy's
+    vision input for that view.
+
+    ``n_frames <= 1``  -> the frame itself (1, C, H, W), back-compatible with single-frame JITs.
+    ``n_frames > 1``   -> (1, n_frames, C, H, W), ordered OLDEST-first / NEWEST-last, left-padded
+    with the FIRST frame after reset until the window fills. This reproduces IsaacLab's
+    ``CircularBuffer`` history padding (isaaclab/utils/buffers/circular_buffer.py:136-141): the
+    first observation after a reset fills every history slot, and older slots keep that first
+    frame until real frames overwrite them (newest -> oldest). E.g. for n_frames=4 with frames
+    A,B,C,D,E: [A,A,A,A] -> [A,A,A,B] -> [A,A,B,C] -> [A,B,C,D] -> [B,C,D,E].
+
+    ``history`` is a ``deque(maxlen=n_frames)`` and MUST be ``.clear()``-ed on every episode
+    reset (alongside proprio_history) so a new episode re-pads from its own first frame.
+    """
+    history.append(frame_t)
+    if n_frames <= 1:
+        return frame_t
+    frames = list(history)                    # oldest -> newest (append adds at the right)
+    while len(frames) < n_frames:
+        frames.insert(0, frames[0])           # left-pad with the first/oldest frame
+    return torch.stack(frames, dim=1)         # (1, n_frames, C, H, W)
 
 
 def _load_jit_metadata(jit_path: str) -> dict:
@@ -330,55 +634,32 @@ def _load_jit_metadata(jit_path: str) -> dict:
               help='Std of Gaussian noise added to raw arm actions (pre-scale).')
 @click.option('--collect_sysid', default=None, type=str,
               help='Save on-policy sysid data to .pt file (joint traj + OSC targets)')
-@click.option('--use_da3_fusion/--no_da3_fusion', default=True,
-              help='Use DA3 metric depth fusion with RealSense (better at hole-y/specular pixels).')
-@click.option('--da3_only', is_flag=True, default=False,
-              help='Feed raw DA3 metric depth to the policy, skipping RealSense entirely (implies DA3 is used).')
-@click.option('--use_nested', is_flag=True, default=False,
-              help='Use DA3NESTED-GIANT-LARGE (multi-view history=2) instead of DA3METRIC-LARGE.')
-@click.option('--da3_process_res', default=378, type=int, show_default=True,
-              help='DA3NESTED processing resolution (252=~78ms, 378=~146ms, 504=~241ms on RTX4090).')
-@click.option('--wrist_cam_extrinsic', default=None, type=str,
-              help='Path to (4,4) float64 .npy: camera-to-wrist_3_link transform (for pose conditioning).')
-@click.option('--side_cam_extrinsic', default=None, type=str,
-              help='Path to (4,4) float64 .npy: world-to-side-camera transform (for pose conditioning).')
 @click.option('--torch_device', default='cuda', type=str,
               help='Torch device for JIT inference.')
+@click.option('--proprio_mode', default='full',
+              type=click.Choice(['full', 'slim', 'slim_gripper']),
+              help="Proprio layout: 'full' = prev_actions + joint_pos(12) + "
+                   "ee_pose (125 dims); 'slim' drops prev_actions and the 6 "
+                   "synthetic mimic gripper joints (60 dims), same term order; "
+                   "'slim_gripper' is 'slim' plus a 1-d measured gripper close "
+                   "fraction appended after ee_pose (65 dims), matching the "
+                   "...-ArmProprio-GripperAux-v0 task.")
 def main(input, output, robot_ip, match_dataset, match_episode,
          vis_camera_idx, init_joints, max_duration,
          frequency, save_video, action_noise,
-         collect_sysid, use_da3_fusion, da3_only,
-         use_nested, da3_process_res, wrist_cam_extrinsic, side_cam_extrinsic,
-         torch_device):
+         collect_sysid, torch_device, proprio_mode):
+    # slim / slim_gripper proprio: no prev_action term, arm-only joint_pos (see
+    # _build_proprio_tensor). slim_gripper additionally appends the measured
+    # gripper close fraction term after ee_pose.
+    include_prev_action = proprio_mode == 'full'
+    include_gripper_joints = proprio_mode == 'full'
+    include_gripper_progress = proprio_mode == 'slim_gripper'
+    print(f"Proprio mode: {proprio_mode}")
     # Per-axis Cartesian scale matching simulation DiffIK config.
     # Identical to eval_real_robot.py — sim's RelCartesianOSCEvalAction scales.
     CARTESIAN_SCALE = np.array([0.01, 0.01, 0.002, 0.02, 0.02, 0.2])
     print(f"Cartesian OSC scale: {CARTESIAN_SCALE}")
-    if da3_only:
-        use_da3_fusion = True
-        print("[da3_only] Bypassing RealSense — feeding raw DA3 metric depth to policy.")
-    if use_nested:
-        use_da3_fusion = True
-        print("[use_nested] DA3NESTED-GIANT-LARGE enabled (multi-view history=2).")
-
-    # Select DA3 model and load optional pose-conditioning calibration matrices
-    da3_model_id = ('depth-anything/DA3NESTED-GIANT-LARGE' if use_nested
-                    else 'depth-anything/DA3METRIC-LARGE')
-
-    wrist_cam_T: 'np.ndarray | None' = None   # camera-in-wrist_3_link (4×4)
-    side_cam_w2c: 'np.ndarray | None' = None  # world-to-side-cam (4×4)
-    if use_nested and wrist_cam_extrinsic:
-        wrist_cam_T = np.load(wrist_cam_extrinsic).astype(np.float64)
-        assert wrist_cam_T.shape == (4, 4), "--wrist_cam_extrinsic must be (4,4)"
-        print(f"[pose] Wrist cam-in-EE transform loaded from {wrist_cam_extrinsic}")
-    if use_nested and side_cam_extrinsic:
-        side_cam_w2c = np.load(side_cam_extrinsic).astype(np.float64)
-        assert side_cam_w2c.shape == (4, 4), "--side_cam_extrinsic must be (4,4)"
-        print(f"[pose] Side world-to-cam transform loaded from {side_cam_extrinsic}")
-
-    use_pose = use_nested and (wrist_cam_T is not None) and (side_cam_w2c is not None)
-    if use_nested and not use_pose:
-        print("[pose] No extrinsic files provided — running NESTED without pose conditioning.")
+    print(f"Depth clip: {DEPTH_CLIP} m (no-return → {DEPTH_CLIP[1]} m)")
 
     sysid_records = []  # list of (joint_pos, target_pos, target_quat)
 
@@ -404,6 +685,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     match_camera_idx = 0
     episode_first_frame_map = dict()
     if match_dataset is not None:
+        # Imported lazily: skvideo is absent from the foundstereo env this script
+        # now runs in, and --match_dataset is an optional parity feature.
+        import skvideo.io
         match_dir = pathlib.Path(match_dataset)
         match_video_dir = match_dir.joinpath('videos')
         for vid_dir in match_video_dir.glob("*/"):
@@ -415,10 +699,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     print(f"Loaded initial frame for {len(episode_first_frame_map)} episodes")
 
     # ── Load depth policy + metadata ───────────────────────────────────────
+    # Only the D435 side camera goes through RealEnv; front comes from the Orbbec.
     configs = [
-        json.load(open("diffusion_policy/real_world/realsense_config/455_front.json")),
         json.load(open("diffusion_policy/real_world/realsense_config/435_side.json")),
-        json.load(open("diffusion_policy/real_world/realsense_config/415_wrist.json")),
     ]
 
     device = torch.device(torch_device if torch.cuda.is_available() and torch_device.startswith('cuda') else 'cpu')
@@ -429,10 +712,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     expected_proprio = int(meta.get("num_proprio", 0))
     expected_h = int(meta.get("image_h", DEPTH_IMG_H))
     expected_w = int(meta.get("image_w", DEPTH_IMG_W))
-    expected_groups = meta.get("vision_groups", "side_depth,wrist_depth").split(",")
-    if expected_groups != ["side_depth", "wrist_depth"]:
+    expected_groups = meta.get("vision_groups", "side_depth,front_depth").split(",")
+    if expected_groups != ["side_depth", "front_depth"]:
         raise ValueError(
-            f"This eval script is wired for vision_groups=['side_depth', 'wrist_depth']; "
+            f"This eval script is wired for vision_groups=['side_depth', 'front_depth']; "
             f"JIT was trained with {expected_groups}. Update the camera plumbing if "
             f"the policy expects a different camera set."
         )
@@ -441,6 +724,13 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             f"JIT expects {expected_h}x{expected_w} depth, but this script always "
             f"resizes to {DEPTH_IMG_H}x{DEPTH_IMG_W}. Update DEPTH_IMG_H/W to match."
         )
+    # Frame-stacked policies (e.g. the 4-frame depth students) declare n_frames>1 in the sidecar.
+    # We then keep a per-view depth-frame history and feed (1, n_frames, 1, H, W) per view, padded
+    # per IsaacLab CircularBuffer semantics (see _stack_view). n_frames==1 keeps the single-frame path.
+    expected_n_frames = int(meta.get("n_frames", 1))
+    if expected_n_frames > 1:
+        print(f"[frame stacking] policy expects n_frames={expected_n_frames} per depth view; "
+              f"maintaining per-view image history with first-frame (IsaacLab) padding.")
 
     # ── setup experiments ──────────────────────────────────────────────────
     dt = 1 / frequency
@@ -452,15 +742,45 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
     side_depth_mean = 0.0
     side_depth_std = 0.0
-    wrist_depth_mean = 0.0
-    wrist_depth_std = 0.0
+    front_depth_mean = 0.0
+    front_depth_std = 0.0
     timestep = 0
+    # Per-step frame-age/skew samples (seconds), measured right before inference.
+    # age = now - true capture time (device stamp mapped to host clock, see
+    # _build_depth_obs); skew = side_ts - front_ts (positive → side frame newer).
+    side_age_log, front_age_log, cam_skew_log = [], [], []
+
+    def _print_depth_stats():
+        """Running mean/std of the normalised policy inputs — useful for spotting
+        a sim/real gap in the depth distribution. No-ops before the first step."""
+        if timestep == 0:
+            print("No depth stats yet (0 steps).")
+            return
+        print(f"Side depth  mean: {side_depth_mean / timestep:.4f}, "
+              f"std: {side_depth_std / timestep:.4f}")
+        print(f"Front depth mean: {front_depth_mean / timestep:.4f}, "
+              f"std: {front_depth_std / timestep:.4f}")
+        _print_latency_stats()
+
+    def _print_latency_stats():
+        """Frame age at inference time + side-vs-front skew, in ms."""
+        if not side_age_log:
+            print("No latency stats yet (0 steps).")
+            return
+        for name, log in (("side age ", side_age_log),
+                          ("front age", front_age_log),
+                          ("skew s-f ", cam_skew_log)):
+            a = np.asarray(log) * 1000.0
+            print(f"[latency] {name}: mean {a.mean():6.1f} ms, std {a.std():5.1f}, "
+                  f"p50 {np.percentile(a, 50):6.1f}, p95 {np.percentile(a, 95):6.1f}, "
+                  f"max {a.max():6.1f}  (n={len(a)})")
 
     pathlib.Path(output).mkdir(parents=True, exist_ok=True)
     with SharedMemoryManager() as shm_manager:
-        with DA3DepthClient(device=0, model_id=da3_model_id,
-                            process_res=da3_process_res if use_nested else None) as da3_client, \
-             Spacemouse(shm_manager=shm_manager) as sm, \
+        # The Orbbec joins the `with` so its pipeline is always torn down, even if
+        # startup (policy warmup, RealEnv obs) raises — otherwise the SDK aborts
+        # the process and hides the real traceback.
+        with OrbbecDepthBackground() as orbbec_bg, \
              RealEnv(
                 output_dir=output,
                 robot_ip=robot_ip,
@@ -474,7 +794,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 record_raw_video=True,
                 rolling_action_buffer=True,
                 action_mode='cartesian',
-                camera_serial_numbers=[FRONT_SERIAL, SIDE_SERIAL, WRIST_SERIAL],
+                camera_serial_numbers=[SIDE_SERIAL],
                 camera_configs=configs,
                 thread_per_video=3,
                 video_crf=21,
@@ -485,40 +805,15 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             print("Waiting for realsense")
             time.sleep(5.0)
 
-            if use_da3_fusion:
-                _ready_timeout = 180.0 if use_nested else 120.0
-                print(f"Waiting for DA3 model to be ready (timeout={_ready_timeout:.0f}s)...")
-                da3_client.wait_ready(timeout=_ready_timeout)
-                print('DA3 model ready.')
+            # Depth scale — read once after the camera is ready.
+            side_depth_scale = env.realsense.cameras[SIDE_SERIAL].get_depth_scale()
+            print(f'Depth scale — side: {side_depth_scale:.5f} m/unit')
 
-            # Depth scales + intrinsics — read once after cameras are ready.
-            side_depth_scale  = env.realsense.cameras[SIDE_SERIAL].get_depth_scale()
-            wrist_depth_scale = env.realsense.cameras[WRIST_SERIAL].get_depth_scale()
-            side_K  = env.realsense.cameras[SIDE_SERIAL].get_intrinsics()
-            wrist_K = env.realsense.cameras[WRIST_SERIAL].get_intrinsics()
-            SIDE_FOCAL_PX  = float(side_K[0, 0] + side_K[1, 1]) / 2.0
-            WRIST_FOCAL_PX = float(wrist_K[0, 0] + wrist_K[1, 1]) / 2.0
-            print(f'Depth scales — side: {side_depth_scale:.5f}, wrist: {wrist_depth_scale:.5f}')
-            print(f'Focal lengths — side: {SIDE_FOCAL_PX:.1f} px, wrist: {WRIST_FOCAL_PX:.1f} px')
-
-            # For NESTED, push intrinsics into shared memory once (used for pose conditioning)
-            if use_nested and use_da3_fusion:
-                da3_client.set_intrinsics(side_K, wrist_K)
-
-            # ── DA3 background inference thread ───────────────────────────
-            # Continuously processes queued RGB frames so the control loop
-            # can read pre-computed depth without blocking on DA3 inference.
-            da3_bg: DA3DepthBackground | None = None
-            if use_da3_fusion:
-                da3_bg = DA3DepthBackground(da3_client, SIDE_FOCAL_PX, WRIST_FOCAL_PX)
-                da3_bg.start()
-                print('DA3 background inference thread started.')
+            _preflight_realsense(env, n_obs_steps)
 
             # ── Depth video writer (mirrors demo_real_robot.py panels) ─────
             depth_video_writer = None
             depth_raw_video_writer = None
-            rs_debug_video_writer = None
-            da3_debug_video_writer = None
             if save_video:
                 cv2.namedWindow('Depth (policy input)', cv2.WINDOW_NORMAL)
                 cv2.resizeWindow('Depth (policy input)', DEPTH_IMG_W * 2, DEPTH_IMG_H)
@@ -538,47 +833,51 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     (DEPTH_IMG_W * 2, DEPTH_IMG_H),
                 )
                 print(f'Policy-input raw depth video → {depth_raw_video_path}')
-                rs_debug_path = pathlib.Path(output) / 'debug_realsense_raw.mp4'
-                rs_debug_video_writer = cv2.VideoWriter(
-                    str(rs_debug_path),
-                    cv2.VideoWriter_fourcc(*'mp4v'),
-                    int(frequency),
-                    (DEPTH_IMG_W * 2, DEPTH_IMG_H),
-                )
-                print(f'RealSense raw depth video → {rs_debug_path}')
-                if use_da3_fusion:
-                    da3_debug_path = pathlib.Path(output) / 'debug_da3_metric.mp4'
-                    da3_debug_video_writer = cv2.VideoWriter(
-                        str(da3_debug_path),
-                        cv2.VideoWriter_fourcc(*'mp4v'),
-                        int(frequency),
-                        (DEPTH_IMG_W * 2, DEPTH_IMG_H),
-                    )
-                    print(f'DA3 metric depth video → {da3_debug_path}')
 
             # ── Warm up policy with current obs (no inference latency in step 0) ──
             print("Warming up policy inference")
             obs = env.get_obs()
             obs['end_effector_pose'] = compute_calibrated_ee_pose(obs['arm_joint_pos'])
             arm_jp_now = obs['arm_joint_pos'][-1]
-            grip_now = float(obs['gripper_pos'][-1])
+            grip_now = _last_scalar(obs['gripper_pos'])
             warmup_frame = {
                 "prev_action": np.zeros(PREV_ACTION_DIM, dtype=np.float32),
-                "joint_pos":   _build_joint_pos(arm_jp_now, grip_now),
+                "joint_pos":   _build_joint_pos(arm_jp_now, grip_now,
+                                                include_gripper=include_gripper_joints),
                 "ee_pose":     obs['end_effector_pose'][-1].astype(np.float32),
+                "gripper_progress": _gripper_close_progress(grip_now),
             }
             warmup_history = deque([warmup_frame] * HISTORY_LEN, maxlen=HISTORY_LEN)
-            warmup_proprio = _build_proprio_tensor(warmup_history, device)
+            warmup_proprio = _build_proprio_tensor(
+                warmup_history, device, include_prev_action=include_prev_action,
+                include_gripper_progress=include_gripper_progress)
             if expected_proprio and warmup_proprio.shape[-1] != expected_proprio:
                 raise ValueError(
                     f"proprio dim mismatch: built {warmup_proprio.shape[-1]} but JIT "
-                    f"expects {expected_proprio}. Check joint_pos construction "
+                    f"expects {expected_proprio}. Check --proprio_mode "
+                    f"({proprio_mode}), joint_pos construction "
                     f"(NUM_JOINTS={NUM_JOINTS}) and the proprio cfg."
                 )
-            warmup_depth = torch.zeros(1, 1, DEPTH_IMG_H, DEPTH_IMG_W, device=device)
+            # Warm up on REAL depth, through the same helpers the loop uses, rather
+            # than on zeros: a zeros warmup exercises neither the true dtype nor the
+            # true shape, so a bad frame would only surface at iteration 0 of a live
+            # episode — with the robot already moving. Fail here instead.
+            warmup_side, warmup_front = _build_depth_obs(
+                env, orbbec_bg, side_depth_scale)[:2]
+            warmup_side_t  = torch.from_numpy(warmup_side).to(device, torch.float32)[None, None]
+            warmup_front_t = torch.from_numpy(warmup_front).to(device, torch.float32)[None, None]
+            # Exercise the exact (frame-stacked) vision shape the loop will feed, using throwaway
+            # per-view histories so a shape/dtype bug fails here rather than mid-episode.
+            _ws_hist = deque(maxlen=expected_n_frames)
+            _wf_hist = deque(maxlen=expected_n_frames)
+            warmup_side_in  = _stack_view(_ws_hist, warmup_side_t, expected_n_frames)
+            warmup_front_in = _stack_view(_wf_hist, warmup_front_t, expected_n_frames)
             with torch.no_grad():
-                action_mean = policy(warmup_proprio, [warmup_depth, warmup_depth])
-                print(f"Warmup OK; action shape={tuple(action_mean.shape)}")
+                action_mean = policy(warmup_proprio, [warmup_side_in, warmup_front_in])
+                print(f"Warmup OK on live depth "
+                      f"(side {warmup_side.dtype}{warmup_side.shape}, "
+                      f"front {warmup_front.dtype}{warmup_front.shape}); "
+                      f"action shape={tuple(action_mean.shape)}")
                 del action_mean
 
             print('Ready!')
@@ -603,27 +902,27 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             actions = []
             gripper_open_steps_remaining = 0
             GRIPPER_OPEN_DURATION = 5
-            STUCK_WINDOW_S = 2.0
-            STUCK_JOINT_THRESHOLD_RAD = 0.002
-            STUCK_GRIPPER_OPEN_STEPS = int(frequency)
-            stuck_buffer = []
 
             # Per-episode state — reset on each new episode start.
             proprio_history: deque = deque(maxlen=HISTORY_LEN)
-            last_raw_action = np.zeros(PREV_ACTION_DIM, dtype=np.float32)
+            # Per-view depth-frame history for frame-stacked policies (n_frames>1). Cleared on
+            # every episode reset alongside proprio_history; _stack_view left-pads with the first
+            # post-reset frame (IsaacLab CircularBuffer semantics). maxlen=1 is a no-op passthrough.
+            side_img_history: deque = deque(maxlen=expected_n_frames)
+            front_img_history: deque = deque(maxlen=expected_n_frames)
 
             while True:
                 # ========== policy control loop ==============
                 try:
                     proprio_history.clear()
-                    last_raw_action = np.zeros(PREV_ACTION_DIM, dtype=np.float32)
+                    side_img_history.clear()
+                    front_img_history.clear()
                     start_delay = 1.0
                     eval_t_start = time.time() + start_delay
                     t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
                     precise_wait(eval_t_start, time_func=time.time)
                     print("Started!")
-                    stuck_buffer.clear()
                     if save_video:
                         episode_id_start = getattr(env.replay_buffer, 'n_episodes', 0)
                         ep_video_path = pathlib.Path(output) / f'policy_cameras_ep_{episode_id_start:03d}.mp4'
@@ -643,145 +942,99 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         # Override EE pose with calibrated FK (wrist_3_link in REP-103 frame)
                         obs['end_effector_pose'] = compute_calibrated_ee_pose(obs['arm_joint_pos'])
 
-                        # ── Queue latest frames for background DA3 inference ──
-                        if use_da3_fusion:
-                            _side_E = _wrist_E = None
-                            if use_pose:
-                                _arm_jp = obs['arm_joint_pos'][-1]
-                                _pos_ee, _quat_ee = get_ee_pose(_arm_jp)
-                                _wrist_E = _ee_to_w2c(_pos_ee, _quat_ee, wrist_cam_T)
-                                _side_E  = side_cam_w2c
-                            da3_bg.put_frame(obs['side_rgb'][-1], obs['wrist_rgb'][-1],
-                                             side_extrinsic=_side_E,
-                                             wrist_extrinsic=_wrist_E)
+                        # ── Build depth obs (same helper the warmup used) ──
+                        side_norm, front_norm, front_rgb_raw, side_ts, front_ts = \
+                            _build_depth_obs(env, orbbec_bg, side_depth_scale)
 
                         # Capture concatenated RGB frames if recording
                         if save_video:
-                            camera_names = ['front_rgb', 'side_rgb', 'wrist_rgb']
                             imgs = []
-                            for cam_name in camera_names:
-                                if cam_name in obs:
-                                    img = obs[cam_name][-1]
-                                    if img.dtype == np.float32 or img.dtype == np.float64:
-                                        img = (img * 255).clip(0, 255).astype(np.uint8)
-                                    imgs.append(img)
-                            if len(imgs) == 3:
-                                frame = np.concatenate(imgs, axis=1)
-                                if episode_video_writer is not None:
-                                    episode_video_writer.append_data(frame)
-                                if long_video_writer is not None:
-                                    long_video_writer.append_data(frame)
-
-                        # ── Build depth obs (mirrors sim's process_image) ──
-                        if env.last_realsense_data is None:
-                            raise RuntimeError("No realsense data yet — was RealEnv started with enable_depth=True?")
-                        rs_side  = env.last_realsense_data[1].get('depth')
-                        rs_wrist = env.last_realsense_data[2].get('depth')
-                        if rs_side is None or rs_wrist is None:
-                            raise RuntimeError("Depth frames missing from realsense buffer.")
-
-                        da3_side_m = da3_wrist_m = None
-                        if use_da3_fusion:
-                            _da3_result = da3_bg.get_latest_da3()
-                            if _da3_result is not None:
-                                da3_side_m, da3_wrist_m, _ = _da3_result
-                                if da3_only:
-                                    side_norm  = _process_metric_depth(da3_side_m)
-                                    wrist_norm = _process_metric_depth(da3_wrist_m)
-                                else:
-                                    fused_side  = DA3DepthClient.fuse_with_realsense(da3_side_m,  rs_side[-1],  side_depth_scale)
-                                    fused_wrist = DA3DepthClient.fuse_with_realsense(da3_wrist_m, rs_wrist[-1], wrist_depth_scale)
-                                    side_norm  = _process_metric_depth(fused_side)
-                                    wrist_norm = _process_metric_depth(fused_wrist)
-                            else:
-                                # No DA3 result yet (first frame) — fall back to raw RealSense.
-                                side_norm  = _process_realsense_depth(rs_side[-1],  side_depth_scale)
-                                wrist_norm = _process_realsense_depth(rs_wrist[-1], wrist_depth_scale)
-                        else:
-                            side_norm  = _process_realsense_depth(rs_side[-1],  side_depth_scale)
-                            wrist_norm = _process_realsense_depth(rs_wrist[-1], wrist_depth_scale)
+                            for img in (front_rgb_raw, obs['side_rgb'][-1]):
+                                if img.dtype in (np.float32, np.float64):
+                                    img = (img * 255).clip(0, 255).astype(np.uint8)
+                                imgs.append(img)
+                            # Orbbec is 1280x960, D435 obs is 640x480 — match heights
+                            # before concatenating.
+                            h = min(i.shape[0] for i in imgs)
+                            imgs = [cv2.resize(i, (int(i.shape[1] * h / i.shape[0]), h))
+                                    for i in imgs]
+                            frame = np.concatenate(imgs, axis=1)
+                            if episode_video_writer is not None:
+                                episode_video_writer.append_data(frame)
+                            if long_video_writer is not None:
+                                long_video_writer.append_data(frame)
 
                         # Visualise depth panels (mirrors demo_real_robot.py overlays)
                         side_vis  = _depth_to_bgr(side_norm)
-                        wrist_vis = _depth_to_bgr(wrist_norm)
-                        side_color  = cv2.resize(obs['side_rgb'][-1][:, :, ::-1],  (DEPTH_IMG_W, DEPTH_IMG_H))
-                        wrist_color = cv2.resize(obs['wrist_rgb'][-1][:, :, ::-1], (DEPTH_IMG_W, DEPTH_IMG_H))
+                        front_vis = _depth_to_bgr(front_norm)
+                        side_color  = cv2.resize(obs['side_rgb'][-1][:, :, ::-1], (DEPTH_IMG_W, DEPTH_IMG_H))
+                        front_color = cv2.resize(front_rgb_raw[:, :, ::-1],       (DEPTH_IMG_W, DEPTH_IMG_H))
                         if side_color.dtype != np.uint8:
                             side_color = (np.clip(side_color, 0.0, 1.0) * 255).astype(np.uint8)
-                        if wrist_color.dtype != np.uint8:
-                            wrist_color = (np.clip(wrist_color, 0.0, 1.0) * 255).astype(np.uint8)
+                        if front_color.dtype != np.uint8:
+                            front_color = (np.clip(front_color, 0.0, 1.0) * 255).astype(np.uint8)
                         side_overlay  = cv2.addWeighted(side_vis,  0.5, side_color,  0.5, 0)
-                        wrist_overlay = cv2.addWeighted(wrist_vis, 0.5, wrist_color, 0.5, 0)
+                        front_overlay = cv2.addWeighted(front_vis, 0.5, front_color, 0.5, 0)
                         cv2.putText(side_overlay,  'SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                        cv2.putText(wrist_overlay, 'WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                        depth_panel = np.concatenate([side_overlay, wrist_overlay], axis=1)
+                        cv2.putText(front_overlay, 'FRONT', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                        depth_panel = np.concatenate([side_overlay, front_overlay], axis=1)
                         if depth_video_writer is not None:
                             depth_video_writer.write(depth_panel)
                         if depth_raw_video_writer is not None:
                             side_vis_raw  = _depth_to_bgr(side_norm).copy()
-                            wrist_vis_raw = _depth_to_bgr(wrist_norm).copy()
+                            front_vis_raw = _depth_to_bgr(front_norm).copy()
                             cv2.putText(side_vis_raw,  'SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                            cv2.putText(wrist_vis_raw, 'WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                            depth_raw_panel = np.concatenate([side_vis_raw, wrist_vis_raw], axis=1)
+                            cv2.putText(front_vis_raw, 'FRONT', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                            depth_raw_panel = np.concatenate([side_vis_raw, front_vis_raw], axis=1)
                             depth_raw_video_writer.write(depth_raw_panel)
-                        if rs_debug_video_writer is not None:
-                            _wh = (DEPTH_IMG_W, DEPTH_IMG_H)
-                            rs_s_m = rs_side[-1].astype(np.float32) * side_depth_scale
-                            rs_w_m = rs_wrist[-1].astype(np.float32) * wrist_depth_scale
-                            rs_s_m[rs_side[-1] == 0] = DEPTH_CLIP[1]
-                            rs_w_m[rs_wrist[-1] == 0] = DEPTH_CLIP[1]
-                            rs_s_vis = _metric_to_bgr(rs_s_m, _wh)
-                            rs_w_vis = _metric_to_bgr(rs_w_m, _wh)
-                            cv2.putText(rs_s_vis, 'RS SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                            cv2.putText(rs_w_vis, 'RS WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                            rs_debug_video_writer.write(np.concatenate([rs_s_vis, rs_w_vis], axis=1))
-                        if da3_debug_video_writer is not None and use_da3_fusion and da3_side_m is not None:
-                            _wh = (DEPTH_IMG_W, DEPTH_IMG_H)
-                            da3_s_vis = _metric_to_bgr(da3_side_m,  _wh)
-                            da3_w_vis = _metric_to_bgr(da3_wrist_m, _wh)
-                            cv2.putText(da3_s_vis, 'DA3 SIDE',  (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                            cv2.putText(da3_w_vis, 'DA3 WRIST', (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-                            da3_debug_video_writer.write(np.concatenate([da3_s_vis, da3_w_vis], axis=1))
 
                         # ── Build proprio frame and append to history ──
                         arm_jp_now = obs['arm_joint_pos'][-1]
-                        grip_pos_raw = float(obs['gripper_pos'][-1])
+                        grip_pos_raw = _last_scalar(obs['gripper_pos'])
                         ee_pose_now  = obs['end_effector_pose'][-1].astype(np.float32)
                         proprio_history.append({
-                            "prev_action": last_raw_action.copy(),
-                            "joint_pos":   _build_joint_pos(arm_jp_now, grip_pos_raw),
+                            # prev_action = the raw action RealEnv last executed (single source
+                            # of truth; tracked in exec_actions, never stalls, zeroed per episode).
+                            "prev_action": env.get_last_action(),
+                            "joint_pos":   _build_joint_pos(arm_jp_now, grip_pos_raw,
+                                                            include_gripper=include_gripper_joints),
                             "ee_pose":     ee_pose_now,
+                            "gripper_progress": _gripper_close_progress(grip_pos_raw),
                         })
-                        proprio_tensor = _build_proprio_tensor(proprio_history, device)
-                        side_t  = torch.from_numpy(side_norm).to(device)[None, None]   # (1,1,H,W)
-                        wrist_t = torch.from_numpy(wrist_norm).to(device)[None, None]
+                        proprio_tensor = _build_proprio_tensor(
+                            proprio_history, device, include_prev_action=include_prev_action,
+                            include_gripper_progress=include_gripper_progress)
+                        # dtype is pinned explicitly: the policy's conv weights are
+                        # float32, and a float64 input fails deep inside the JIT.
+                        side_t  = torch.from_numpy(side_norm).to(device, torch.float32)[None, None]   # (1,1,H,W)
+                        front_t = torch.from_numpy(front_norm).to(device, torch.float32)[None, None]
 
                         side_depth_mean += side_norm.mean()
                         side_depth_std += side_norm.std()
-                        wrist_depth_mean += wrist_norm.mean()
-                        wrist_depth_std += wrist_norm.std()
+                        front_depth_mean += front_norm.mean()
+                        front_depth_std += front_norm.std()
                         timestep += 1
+                        # Frame age at the moment of inference (includes video/vis
+                        # processing above), plus side-vs-front capture skew.
+                        _now = time.time()
+                        side_age_log.append(_now - side_ts)
+                        front_age_log.append(_now - front_ts)
+                        cam_skew_log.append(side_ts - front_ts)
+                        if timestep % 100 == 0:
+                            _print_latency_stats()
                         # ── Run inference ──
+                        # Frame-stack: append this frame to each view's history and left-pad with
+                        # the first post-reset frame (IsaacLab CircularBuffer). n_frames==1 -> the
+                        # single (1,1,H,W) frame unchanged. List order must match vision_groups =
+                        # [side_depth, front_depth].
+                        side_in  = _stack_view(side_img_history, side_t, expected_n_frames)
+                        front_in = _stack_view(front_img_history, front_t, expected_n_frames)
                         with torch.no_grad():
-                            action_mean = policy(proprio_tensor, [side_t, wrist_t]).cpu().numpy()
+                            action_mean = policy(proprio_tensor, [side_in, front_in]).cpu().numpy()
                         # action_mean: (1, num_actions=7) — [arm_delta(6), gripper(1)]
                         raw_action = action_mean[0]  # (7,)
                         if action_noise > 0:
                             raw_action[:6] = raw_action[:6] + np.random.randn(6) * action_noise
-
-                        # Stuck detection (joint range over STUCK_WINDOW_S)
-                        if gripper_open_steps_remaining == 0:
-                            t_now = time.monotonic()
-                            stuck_buffer.append((t_now, arm_jp_now.copy()))
-                            while stuck_buffer and (t_now - stuck_buffer[0][0]) > STUCK_WINDOW_S:
-                                stuck_buffer.pop(0)
-                            if len(stuck_buffer) >= STUCK_WINDOW_S * frequency:
-                                jps = np.array([b[1] for b in stuck_buffer])
-                                range_per_joint = jps.max(axis=0) - jps.min(axis=0)
-                                if np.max(range_per_joint) < STUCK_JOINT_THRESHOLD_RAD:
-                                    gripper_open_steps_remaining = STUCK_GRIPPER_OPEN_STEPS
-                                    stuck_buffer.clear()
-                                    print("[Stuck detection] No movement for 2s, opening gripper")
 
                         # Gripper open macro
                         gripper_action = raw_action[6:7].copy()
@@ -790,9 +1043,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             gripper_open_steps_remaining -= 1
                             if gripper_open_steps_remaining == 0:
                                 print("[Gripper macro] done, returning to policy control")
-                        # Persist (possibly-overridden) action so next step's prev_action
-                        # mirrors what the action manager would store in sim.
-                        last_raw_action = np.concatenate([raw_action[:6], gripper_action]).astype(np.float32)
+                        # prev_action is now tracked by RealEnv (set from obs_actions in
+                        # exec_actions below); no local last_raw_action bookkeeping needed.
 
                         # ── Cartesian OSC: scale delta, compute absolute target ──
                         scaled_delta = raw_action[:6] * CARTESIAN_SCALE
@@ -846,13 +1098,11 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             save_sysid_data()
                             env.end_episode()
                             print('Stopped.')
-                            print(f"Side depth mean: {side_depth_mean / timestep}, std: {side_depth_std / timestep}")
-                            print(f"Wrist depth mean: {wrist_depth_mean / timestep}, std: {wrist_depth_std / timestep}")
+                            _print_depth_stats()
                             break
                         elif key_stroke == ord('r'):
                             save_sysid_data()
                             sysid_records.clear()
-                            stuck_buffer.clear()
                             print('Resetting robot for new trajectory...')
                             env.end_episode()
                             if save_video and episode_video_writer is not None:
@@ -860,7 +1110,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                                 episode_video_writer = None
                                 print(f"  Episode video saved.")
                             proprio_history.clear()
-                            last_raw_action = np.zeros(PREV_ACTION_DIM, dtype=np.float32)
+                            side_img_history.clear()
+                            front_img_history.clear()
                             env.robot.reset_to_initial_position()
                             time.sleep(5.0)
                             start_delay = 1.0
@@ -874,10 +1125,11 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             timestep = 0
                             side_depth_mean = 0.0
                             side_depth_std = 0.0
-                            wrist_depth_mean = 0.0
-                            wrist_depth_std = 0.0
-                            print(f"Side depth mean: {side_depth_mean / timestep}, std: {side_depth_std / timestep}")
-                            print(f"Wrist depth mean: {wrist_depth_mean / timestep}, std: {wrist_depth_std / timestep}")
+                            front_depth_mean = 0.0
+                            front_depth_std = 0.0
+                            side_age_log.clear()
+                            front_age_log.clear()
+                            cam_skew_log.clear()
                             continue
 
                         # auto termination
@@ -916,12 +1168,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         depth_video_writer.release()
                     if depth_raw_video_writer is not None:
                         depth_raw_video_writer.release()
-                    if rs_debug_video_writer is not None:
-                        rs_debug_video_writer.release()
-                    if da3_debug_video_writer is not None:
-                        da3_debug_video_writer.release()
-                    if da3_bg is not None:
-                        da3_bg.stop()
+                    # Orbbec teardown is handled by the `with` block's __exit__.
                     break
 
                 print("Stopped.")
@@ -937,10 +1184,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     depth_video_writer.release()
                 if depth_raw_video_writer is not None:
                     depth_raw_video_writer.release()
-                if rs_debug_video_writer is not None:
-                    rs_debug_video_writer.release()
-                if da3_debug_video_writer is not None:
-                    da3_debug_video_writer.release()
+                # NOTE: no orbbec_bg.stop() here — this is the tail of the outer
+                # `while True`, which loops round to start another episode. Only
+                # the except branch truly exits, so teardown lives there.
 
 
 # %%

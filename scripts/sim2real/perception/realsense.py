@@ -12,6 +12,8 @@ def gather_realsense_cameras(
     high_res_rgb=False,
     align=None,
     hardware_reset=False,
+    color_wh=None,
+    color_fps=30,
 ):
     context = rs.context()
     all_devices = list(context.devices)
@@ -21,8 +23,14 @@ def gather_realsense_cameras(
         if hardware_reset:
             device.hardware_reset()
             time.sleep(1)
+        # color_wh may be a single (w,h) applied to all, or a {serial: (w,h)} dict for
+        # per-camera resolution (e.g. D435/D415 at 1080p, D455 capped at 720p).
+        serial = str(device.get_info(rs.camera_info.serial_number))
+        cw = color_wh.get(serial) if isinstance(color_wh, dict) else color_wh
+        cf = color_fps.get(serial, 30) if isinstance(color_fps, dict) else color_fps
         rs_camera = RealSenseCamera(
-            device, rgb=rgb, depth=depth, ir=ir, high_res_rgb=high_res_rgb, align=align
+            device, rgb=rgb, depth=depth, ir=ir, high_res_rgb=high_res_rgb, align=align,
+            color_wh=cw, color_fps=cf
         )
         all_rs_cameras.append(rs_camera)
 
@@ -31,12 +39,14 @@ def gather_realsense_cameras(
 
 class RealSenseCamera:
     def __init__(
-        self, device, rgb=True, depth=False, ir=False, high_res_rgb=False, align=None
+        self, device, rgb=True, depth=False, ir=False, high_res_rgb=False, align=None,
+        color_wh=None, color_fps=30,
     ):
-        
+
         self._pipeline = rs.pipeline()
         self._serial_number = str(device.get_info(rs.camera_info.serial_number))
         self._config = rs.config()
+        self._capture_clock_offset = None
 
         self._config.enable_device(self._serial_number)
 
@@ -44,15 +54,26 @@ class RealSenseCamera:
         self.depth = depth
         self.rgb = rgb
 
+        # Ask librealsense to map device timestamps onto the host clock when supported.
+        # The read path still has a hardware-clock fallback for older devices/firmware.
+        try:
+            for sensor in device.query_sensors():
+                if sensor.supports(rs.option.global_time_enabled):
+                    sensor.set_option(rs.option.global_time_enabled, 1.0)
+        except Exception:
+            pass
+
         if self.rgb or align == "rgb":
-            if high_res_rgb:
-                self._config.enable_stream(
-                    rs.stream.color, 1280, 720, rs.format.bgr8, 30
-                )
+            # explicit color_wh wins; else high_res_rgb -> 1280x720, else 640x480.
+            if color_wh is not None:
+                cw, ch = int(color_wh[0]), int(color_wh[1])
+            elif high_res_rgb:
+                cw, ch = 1280, 720
             else:
-                self._config.enable_stream(
-                    rs.stream.color, 640, 480, rs.format.bgr8, 30
-                )
+                cw, ch = 640, 480
+            self._config.enable_stream(
+                rs.stream.color, cw, ch, rs.format.bgr8, int(color_fps)
+            )
         if self.depth or align == "depth":
             self._config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
         if self.ir:
@@ -118,6 +139,26 @@ class RealSenseCamera:
         intrinsics["distCoeffs"] = np.array(list(params.coeffs))
         return intrinsics
 
+    def _capture_time(self, frame, fallback):
+        """Best-effort frame exposure time expressed as host epoch seconds."""
+        try:
+            frame_s = float(frame.get_timestamp()) * 1e-3
+            domain = frame.get_frame_timestamp_domain()
+            if domain == rs.timestamp_domain.system_time and abs(fallback - frame_s) < 10.0:
+                return frame_s
+
+            # Hardware-clock fallback: learn its offset from the host clock. Keeping the
+            # smallest observed offset avoids baking transient USB/application delay into it.
+            candidate = fallback - frame_s
+            if self._capture_clock_offset is None:
+                self._capture_clock_offset = candidate
+            else:
+                self._capture_clock_offset = min(self._capture_clock_offset, candidate)
+            mapped = frame_s + self._capture_clock_offset
+            return mapped if abs(fallback - mapped) < 10.0 else fallback
+        except Exception:
+            return fallback
+
     def read_camera(self):
 
         out = {}
@@ -138,6 +179,7 @@ class RealSenseCamera:
 
         if self.rgb:
             color_frame = frames.get_color_frame()
+            capture_time = self._capture_time(color_frame, time.time())
             out["rgb"] = cv2.cvtColor(
                 np.asanyarray(color_frame.get_data()), cv2.COLOR_BGR2RGB
             )
@@ -147,6 +189,7 @@ class RealSenseCamera:
             out["depth"] = np.asanyarray(depth_frame.get_data())
 
         out["read_time"] = time.time()
+        out["capture_time"] = capture_time if self.rgb else out["read_time"]
 
         return out
 
