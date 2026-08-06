@@ -135,7 +135,13 @@ def optimal_row_cols(
     ):
     out_w, out_h = max_resolution
     out_wh_ratio = out_w / out_h
-    
+
+    # No cameras -> nothing to lay out (e.g. the env runs with only an externally-owned
+    # camera, like eval_real_robot_pc.py's PC pipeline). Return a 1x1 full-res tile so the
+    # (unused) vis transform has valid dims instead of argmin-ing an empty sequence.
+    if n_cameras < 1:
+        return out_w, out_h, 1, 1
+
     n_rows = np.arange(n_cameras,dtype=np.int64) + 1
     n_cols = np.ceil(n_cameras / n_rows).astype(np.int64)
     cat_wh_ratio = in_wh_ratio * (n_cols / n_rows)

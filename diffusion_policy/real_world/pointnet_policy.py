@@ -178,6 +178,7 @@ class PointNetPolicy:
     def predict_from_state(self, points, arm_joint_pos, gripper_pos_raw) -> np.ndarray:
         """Convenience: assemble proprio from raw robot scalars, then predict.
 
+<<<<<<< HEAD
         Proprio layout: if ``self.include_gripper_joints`` is set (True/False) it is authoritative;
         otherwise it is auto-picked from ``proprio_dim`` (18 -> arm+gripper joints+ee_pose;
         12 -> arm joints + ee_pose only, the ``*_no_gripper`` layout with the mimic joints dropped).
@@ -185,6 +186,12 @@ class PointNetPolicy:
         if self.include_gripper_joints is not None:
             include_gripper_joints = self.include_gripper_joints
         elif self.proprio_dim == 18:
+=======
+        Proprio layout follows the checkpoint's ``proprio_dim``: 18 -> arm+gripper joints+ee_pose;
+        12 -> arm joints + ee_pose only (``*_no_gripper`` models drop the mimic gripper joints).
+        """
+        if self.proprio_dim == 18:
+>>>>>>> e45600ad44308afb130bb705f0d3983853f65018
             include_gripper_joints = True
         elif self.proprio_dim == 12:
             include_gripper_joints = False

@@ -221,16 +221,20 @@ if __name__ == "__main__":
                              "Default 24in/11; pass the measured value for accurate scale.")
     parser.add_argument("--marker_length", type=float, default=0.04,
                         help="ArUco marker side in metres (detection only).")
+<<<<<<< HEAD
     parser.add_argument("--serial", default=None,
                         help="Calibrate ONLY this camera serial, opening just that device "
                              "(realsense only) -- skips the others (e.g. the moving wrist) and "
                              "avoids multi-depth-stream USB bandwidth issues.")
+=======
+>>>>>>> e45600ad44308afb130bb705f0d3983853f65018
     args = parser.parse_args()
 
     # Number of calibration rounds
     NUM_CALIBRATION_ROUNDS = args.rounds
 
     # gather cameras
+<<<<<<< HEAD
     if args.serial and args.camera == "realsense":
         # open only the requested RealSense (don't start the others' depth streams)
         import time
@@ -287,6 +291,9 @@ if __name__ == "__main__":
         multi_camera_wrapper = _SingleCam(cam)
     else:
         multi_camera_wrapper = MultiCameraWrapper(rgb=True, depth=True, ir=False, high_res_rgb=False, align="rgb", type=args.camera)
+=======
+    multi_camera_wrapper = MultiCameraWrapper(rgb=True, depth=True, ir=False, high_res_rgb=False, align="rgb", type=args.camera)
+>>>>>>> e45600ad44308afb130bb705f0d3983853f65018
     num_cameras = multi_camera_wrapper.num_cameras
     print(f"Number of cameras: {num_cameras}")
 
