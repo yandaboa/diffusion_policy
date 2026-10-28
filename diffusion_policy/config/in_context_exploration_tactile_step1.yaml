@@ -28,13 +28,6 @@ task:
       - dataset_dir:  datasets/tactile_pick_step1
         sampling_ratio: 0.75
     
-    # dataset_config:
-    #   - dataset_dir: "/gpfs/scrubbed/sriyash/pg_no_randomization_5k"
-    #     sampling_ratio: 0.2
-    #   - dataset_dir: "/gpfs/scrubbed/sriyash/pg_exploration_step1"
-    #     sampling_ratio: 0.3
-    #   - dataset_dir: "/gpfs/scrubbed/sriyash/pg_exploration_step2"
-    #     sampling_ratio: 0.5
       
 policy:
   _target_: diffusion_policy.policy.transformer_image_policy.TransformerImagePolicy

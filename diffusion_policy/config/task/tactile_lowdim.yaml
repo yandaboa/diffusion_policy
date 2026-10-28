@@ -9,7 +9,7 @@ shape_meta: &shape_meta
       shape: [6]
       type: low_dim
     last_arm_action:
-      shape: [3]
+      shape: [6]
       type: low_dim
     last_gripper_action:
       shape: [1]
@@ -28,7 +28,7 @@ shape_meta: &shape_meta
     #   shape: [3]
     #   type: low_dim
   action:
-    shape: [4]
+    shape: [7]
 
 task_name: &task_name sim2real_image
 
@@ -39,7 +39,7 @@ dataset:
   _target_: diffusion_policy.dataset.sim2real_image_dataset.Sim2RealImageMultiDataset
   
   dataset_config:
-    - dataset_dir: ../OctiLab/datasets/0
+    - dataset_dir: datasets/tactile_pick_step0
       sampling_ratio: 0.9
   
   use_streaming: false
